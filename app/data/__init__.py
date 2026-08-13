@@ -1,0 +1,1 @@
+"""Data package: fetching, cleaning and storing market data."""
