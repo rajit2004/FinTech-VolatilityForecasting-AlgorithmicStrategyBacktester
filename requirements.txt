@@ -1,0 +1,33 @@
+# Core data and numerical libraries
+numpy>=1.26
+pandas>=2.2
+scikit-learn>=1.4
+
+# Deep learning, Keras 3 with the JAX backend (TensorFlow has no wheels for Python 3.14 yet, so we use Keras 3 which lets us pick the backend freely).
+# Keras no longer ships a 'jax' extra, so jax is listed on its own line.
+keras>=3.15
+jax>=0.4.30
+
+# Data fetching from Yahoo Finance
+yfinance>=0.2.40
+requests>=2.31
+
+# Web API layer
+flask>=3.0
+flask-cors>=4.0
+
+# Database ORM
+SQLAlchemy>=2.0
+
+# PostgreSQL driver used by SQLAlchemy
+psycopg[binary]>=3.1
+
+# Config loading from .env
+python-dotenv>=1.0
+
+# Dashboard
+streamlit>=1.36
+matplotlib>=3.8
+
+# Testing
+pytest>=8.0
