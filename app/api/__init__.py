@@ -1,0 +1,1 @@
+"""API package: Flask routes and request/response validation."""
