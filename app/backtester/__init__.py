@@ -1,0 +1,1 @@
+"""Backtester package: the simulation engine and performance metrics."""
