@@ -1,0 +1,1 @@
+"""Strategies package: the algorithmic trading strategies we backtest."""
