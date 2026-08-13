@@ -262,12 +262,17 @@ def run_volatility_forecast(
 
     # Align the test results with their real calendar dates. For the LSTM
     # each sequence ends at a known row, so its date is offset by the
-    # sequence length. The test set is the tail end of the sample.
-    split = int(len(X) * (1 - 0.2))
+    # sequence length, and the last row is never a sequence target. The
+    # split is computed on the rows that actually reached the model, which
+    # differs between the two model types.
     if model_name == "random_forest":
+        split = int(len(X) * (1 - 0.2))
         test_dates = [d.date().isoformat() for d in dates[split:]]
     else:
-        test_dates = [d.date().isoformat() for d in dates[split + seq_len - 1:]]
+        split_seq = int(len(X_seq) * (1 - 0.2))
+        test_dates = [
+            d.date().isoformat() for d in dates[split_seq + seq_len - 1 : len(dates) - 1]
+        ]
 
     return {
         "model_name": model_name,
