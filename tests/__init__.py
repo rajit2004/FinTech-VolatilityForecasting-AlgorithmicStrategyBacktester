@@ -1,0 +1,1 @@
+"""Tests for the whole project, run with pytest from the project root."""
