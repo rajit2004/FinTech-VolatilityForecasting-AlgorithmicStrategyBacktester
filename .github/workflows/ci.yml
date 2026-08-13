@@ -1,0 +1,45 @@
+name: CI
+
+# Run the test suite on every push to main and on every pull request.
+# This protects the main branch from commits or PRs that break tests before they get merged.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Lets us also trigger a run manually from the Actions tab.
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+
+    # Run on two Python versions so a PR that only works on one machine
+    # is caught early. fail-fast is off so both still report their result.
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.12', '3.14']
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run the test suite
+        run: python -m pytest -q
+
+      # Import only, not create_app, because create_app connects to the
+      # database which is not part of the CI environment. pytest already
+      # covers create_app against an isolated database.
+      - name: Sanity check the app imports
+        run: python -c "import app.main"
