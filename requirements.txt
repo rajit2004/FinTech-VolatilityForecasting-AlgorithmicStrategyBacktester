@@ -8,6 +8,12 @@ scikit-learn>=1.4
 keras>=3.15
 jax>=0.4.30
 
+# Statistical volatility baseline (GARCH models)
+arch>=7.0
+
+# Model explainability (SHAP values for feature importance)
+shap>=0.45
+
 # Data fetching from Yahoo Finance
 yfinance>=0.2.40
 requests>=2.31
