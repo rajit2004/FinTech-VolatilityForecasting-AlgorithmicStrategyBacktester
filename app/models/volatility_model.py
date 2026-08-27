@@ -1,6 +1,6 @@
 """Volatility forecasting models.
 
-Two models are implemented:
+Three models are implemented:
 
 1. RandomForestVolatilityModel: a scikit-learn random forest regressor.
    It maps the engineered features directly to the future volatility.
@@ -10,8 +10,17 @@ Two models are implemented:
    with the JAX backend because TensorFlow has no wheels for Python
    3.14 yet, but the Keras API is exactly the same.
 
-Both models expose a common interface: fit(X, y) and predict(X), which
-is all the rest of the app needs to use them interchangeably.
+3. GARCHVolatilityModel: a GARCH(1,1) baseline from the arch library.
+   GARCH is the classic statistical model for volatility. It models
+   the conditional variance of returns directly, without any feature
+   engineering. This is the benchmark that ML models should beat to
+   prove they are adding value.
+
+The random forest and LSTM share a common interface (fit on features,
+predict from features). The GARCH model works differently: it fits on
+raw log returns and forecasts conditional variance. The
+run_volatility_forecast function hides this difference behind a
+unified call.
 """
 
 import os
@@ -25,8 +34,14 @@ os.environ.setdefault("KERAS_BACKEND", "jax")
 import numpy as np
 import pandas as pd
 
-from app.config import FORECAST_HORIZON_DAYS, LSTM_EPOCHS, LSTM_SEQUENCE_LENGTH
+from app.config import (
+    ANNUALIZATION_FACTOR,
+    FORECAST_HORIZON_DAYS,
+    LSTM_EPOCHS,
+    LSTM_SEQUENCE_LENGTH,
+)
 from app.features.engineering import (
+    FEATURE_COLUMNS,
     build_features,
     make_lstm_sequences,
     prepare_for_model,
@@ -181,6 +196,100 @@ class LSTMVolatilityModel:
         return self._target_scaler.inverse_transform(raw).ravel()
 
 
+class GARCHVolatilityModel:
+    """GARCH(1,1) baseline for volatility forecasting.
+
+    GARCH models are the gold standard statistical baseline in volatility
+    research. Every serious ML paper since 2020 compares against GARCH.
+    The model fits the conditional variance of log returns using an
+    autoregressive structure: today's variance depends on yesterday's
+    squared return and yesterday's variance.
+
+    Unlike the ML models, GARCH does not use engineered features. It
+    works directly on the return series, which makes it a pure
+    statistical baseline. If our ML models cannot beat GARCH, they are
+    not adding real value.
+    """
+
+    def __init__(self, p: int = 1, q: int = 1):
+        """Set up the GARCH order.
+
+        Args:
+            p: number of lagged variances (the GARCH part).
+            q: number of lagged squared returns (the ARCH part).
+        """
+        self.name = "garch"
+        self.p = p
+        self.q = q
+        self.model = None
+        self._fitted = None
+
+    def fit(self, returns: np.ndarray) -> "GARCHVolatilityModel":
+        """Fit the GARCH model on a series of log returns.
+
+        Args:
+            returns: 1D array of daily log returns (not prices, not
+                features). The arch library expects raw returns.
+
+        Returns:
+            self so calls can be chained.
+        """
+        from arch import arch_model
+
+        # Scale returns to percentage so the optimizer has an easier time.
+        # GARCH models are sensitive to the scale of the input, and daily
+        # returns are typically in the range of a few percent, so scaling
+        # to percentage points helps numerical stability.
+        scaled = returns * 100.0
+        self.model = arch_model(
+            scaled,
+            vol="Garch",
+            p=self.p,
+            q=self.q,
+            mean="Constant",
+            dist="Normal",
+        )
+        self._fitted = self.model.fit(disp="off", show_warning=False)
+        logger.info(
+            "GARCH(%d,%d) fitted on %d returns", self.p, self.q, len(returns)
+        )
+        return self
+
+    def predict(self, horizon: int = 1) -> np.ndarray:
+        """Forecast conditional volatility for the next horizon days.
+
+        Args:
+            horizon: how many days ahead to forecast.
+
+        Returns:
+            Array of predicted annualized volatility values. The arch
+            library returns variance, so we take the square root and
+            convert back from percentage scale.
+        """
+        if self._fitted is None:
+            raise RuntimeError("Model has not been fitted yet, call fit() first")
+
+        # forecast() returns an object with .variance and .mean DataFrames.
+        # We need the conditional variance (not residual variance).
+        fcst = self._fitted.forecast(horizon=horizon)
+        variance = fcst.variance.iloc[-1].values
+
+        # Convert from percentage-squared variance to annualized volatility.
+        # sqrt(variance) gives daily vol in percentage, multiply by sqrt(252)
+        # to annualize, then divide by 100 to get back to decimal scale.
+        daily_vol = np.sqrt(variance) / 100.0
+        annualized = daily_vol * np.sqrt(ANNUALIZATION_FACTOR)
+        return annualized
+
+    def predict_next(self) -> float:
+        """Convenience method: forecast volatility for the next single day.
+
+        Returns:
+            A single annualized volatility value.
+        """
+        return float(self.predict(horizon=1)[0])
+
+
 def train_test_split_time(
     X: np.ndarray,
     y: np.ndarray,
@@ -228,16 +337,67 @@ def run_volatility_forecast(
         A dict with predictions, true values, metrics and the next
         forecast, ready to store in the database and return via the API.
     """
-    if model_name not in ("random_forest", "lstm"):
+    valid_models = ("random_forest", "lstm", "garch")
+    if model_name not in valid_models:
         raise ValueError(f"Unknown model: {model_name}")
 
     frame = build_features(df, horizon)
+    clean = frame.dropna(subset=FEATURE_COLUMNS + ["target"])
+    dates = clean.index
+
+    # GARCH works on raw returns, not engineered features. It is a
+    # statistical baseline that models the conditional variance directly.
+    if model_name == "garch":
+        from app.features.engineering import log_returns
+
+        returns = log_returns(df["close"]).dropna()
+        returns_array = returns.values
+
+        # 80/20 time split, same as the other models.
+        split = int(len(returns_array) * 0.8)
+        train_returns = returns_array[:split]
+        test_returns = returns_array[split:]
+
+        model = GARCHVolatilityModel()
+        model.fit(train_returns)
+
+        # Predict one-step-ahead volatility for each test day. In
+        # production you would refit periodically, but for comparison
+        # we refit once and roll forward with the same parameters.
+        test_predictions = np.array([
+            model.predict_next() for _ in range(len(test_returns))
+        ])
+
+        # The true volatility for comparison: realized vol over the same
+        # horizon as the ML models, computed from the test returns.
+        true_vol = np.array([
+            np.std(test_returns[max(0, i - horizon + 1): i + 1])
+            * np.sqrt(ANNUALIZATION_FACTOR)
+            for i in range(len(test_returns))
+        ])
+
+        # The next period forecast uses all available data.
+        model.fit(returns_array)
+        next_forecast = model.predict_next()
+
+        # Align test dates with the return series indices.
+        test_dates = [d.date().isoformat() for d in dates[split:]]
+
+        metrics = evaluate_predictions(true_vol, test_predictions)
+        return {
+            "model_name": model_name,
+            "horizon": horizon,
+            "feature_names": [],
+            "test_predictions": test_predictions.tolist(),
+            "test_true": true_vol.tolist(),
+            "test_dates": test_dates,
+            "metrics": metrics,
+            "next_forecast": next_forecast,
+        }
+
+    # For the ML models we need engineered features.
     X, y, feature_names = prepare_for_model(frame)
     logger.info("Prepared %d samples with %d features", len(X), len(feature_names))
-
-    # The rows that survive NaN removal, their index gives us the dates.
-    clean = frame.dropna(subset=feature_names + ["target"])
-    dates = clean.index
 
     if model_name == "random_forest":
         X_train, X_test, y_train, y_test = train_test_split_time(X, y)

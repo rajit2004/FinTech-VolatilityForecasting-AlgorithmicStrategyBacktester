@@ -16,7 +16,7 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-VALID_MODELS = ("random_forest", "lstm")
+VALID_MODELS = ("random_forest", "lstm", "garch")
 VALID_STRATEGIES = ("moving_average", "volatility_breakout")
 
 
@@ -131,5 +131,10 @@ def parse_backtest_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "symbol": symbol,
         "strategy_name": strategy_name,
         "params": params,
-        "config": {"initial_capital": initial_capital, "commission": commission},
+        "config": {
+            "initial_capital": initial_capital,
+            "commission": commission,
+            "target_volatility": config_payload.get("target_volatility", 0.0),
+            "forecast_volatility": config_payload.get("forecast_volatility", 0.0),
+        },
     }

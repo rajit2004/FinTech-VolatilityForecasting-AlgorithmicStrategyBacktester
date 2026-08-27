@@ -95,14 +95,19 @@ def _forecast_command(args: argparse.Namespace) -> None:
 
 def _backtest_command(args: argparse.Namespace) -> None:
     """Run a backtest for one symbol and strategy, print metrics."""
-    from app.backtester.engine import run_backtest
+    from app.backtester.engine import BacktestConfig, run_backtest
 
     data = fetch_many([args.symbol])[args.symbol]
+    config = BacktestConfig(
+        target_volatility=args.target_vol,
+        forecast_volatility=args.forecast_vol,
+    )
     result = run_backtest(
         symbol=args.symbol,
         df=data,
         strategy_name=args.strategy,
         params={},
+        config=config,
     )
     print(f"strategy: {result.strategy_name} on {result.symbol}")
     for key, value in result.metrics.items():
@@ -125,13 +130,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     forecast = sub.add_parser("forecast", help="train and forecast volatility")
     forecast.add_argument("--symbol", required=True)
-    forecast.add_argument("--model", default="random_forest", choices=["random_forest", "lstm"])
+    forecast.add_argument("--model", default="random_forest", choices=["random_forest", "lstm", "garch"])
     forecast.add_argument("--horizon", type=int, default=5)
     forecast.set_defaults(func=_forecast_command)
 
     backtest = sub.add_parser("backtest", help="run a strategy backtest")
     backtest.add_argument("--symbol", required=True)
     backtest.add_argument("--strategy", default="moving_average")
+    backtest.add_argument("--target-vol", type=float, default=0.0, help="target volatility for position sizing (0=disabled)")
+    backtest.add_argument("--forecast-vol", type=float, default=0.0, help="forecast volatility to scale against")
     backtest.set_defaults(func=_backtest_command)
 
     return parser
