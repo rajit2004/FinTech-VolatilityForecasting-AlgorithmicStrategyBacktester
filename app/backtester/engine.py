@@ -34,6 +34,8 @@ class BacktestConfig:
     commission: float = 0.001  # fraction of the trade value, 0.1%
     position_pct: float = 0.95  # how much of the account we invest
     slippage: float = 0.0  # per share price slippage, zero for simplicity
+    target_volatility: float = 0.0  # if > 0, scale position size by forecast vol
+    forecast_volatility: float = 0.0  # the forecast volatility to scale against
 
 
 @dataclass
@@ -114,8 +116,15 @@ def iter_bar_events(
         # Trade only when the strategy changes its mind.
         if desired != position:
             if desired > 0 and shares == 0:
+                # Volatility-based position sizing: when the forecast says
+                # volatility is high, we trade less to protect capital.
+                # The ratio is capped at 1.0 so we never over-size.
+                vol_scale = 1.0
+                if config.target_volatility > 0 and config.forecast_volatility > 0:
+                    vol_scale = min(config.target_volatility / config.forecast_volatility, 1.0)
+
                 # Buy with a fraction of our cash, integer shares only.
-                budget = cash * config.position_pct
+                budget = cash * config.position_pct * vol_scale
                 shares = max(int(budget / price), 0)
                 if shares > 0:
                     cost = shares * price

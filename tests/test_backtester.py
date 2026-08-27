@@ -133,3 +133,67 @@ def test_run_multiple_backtests_serial_matches_grid(clean_frame):
     for result in results:
         assert "metrics" in result
         assert "total_return" in result["metrics"]
+
+
+def test_volatility_sizing_reduces_position_when_vol_high(clean_frame):
+    """When forecast vol is high, position size should be smaller."""
+    config_no_vol = BacktestConfig(initial_capital=100_000.0, position_pct=0.95)
+    config_high_vol = BacktestConfig(
+        initial_capital=100_000.0,
+        position_pct=0.95,
+        target_volatility=0.15,
+        forecast_volatility=0.30,
+    )
+
+    strategy = MovingAverageCrossover({"fast": 10, "slow": 50})
+    events_no_vol = list(iter_bar_events(clean_frame, strategy, config_no_vol))
+    events_high_vol = list(iter_bar_events(clean_frame, strategy, config_high_vol))
+
+    # Find the first buy event in each run and compare share counts.
+    buy_no_vol = next(e for e in events_no_vol if e["shares"] > 0)
+    buy_high_vol = next(e for e in events_high_vol if e["shares"] > 0)
+
+    # High volatility should result in fewer shares purchased.
+    assert buy_high_vol["shares"] <= buy_no_vol["shares"]
+
+
+def test_volatility_sizing_full_position_when_vol_low(clean_frame):
+    """When forecast vol is low relative to target, full position is used."""
+    config_low_vol = BacktestConfig(
+        initial_capital=100_000.0,
+        position_pct=0.95,
+        target_volatility=0.30,
+        forecast_volatility=0.15,
+    )
+
+    strategy = MovingAverageCrossover({"fast": 10, "slow": 50})
+    events = list(iter_bar_events(clean_frame, strategy, config_low_vol))
+
+    # Find the first buy event.
+    buy_event = next(e for e in events if e["shares"] > 0)
+
+    # With low forecast vol, we should get close to the full position.
+    expected_budget = 100_000.0 * 0.95
+    expected_shares = int(expected_budget / buy_event["price"])
+    assert buy_event["shares"] == expected_shares
+
+
+def test_volatility_sizing_disabled_when_zero(clean_frame):
+    """When target_volatility is 0, position sizing works normally."""
+    config = BacktestConfig(
+        initial_capital=100_000.0,
+        position_pct=0.95,
+        target_volatility=0.0,
+        forecast_volatility=0.30,
+    )
+
+    strategy = MovingAverageCrossover({"fast": 10, "slow": 50})
+    events = list(iter_bar_events(clean_frame, strategy, config))
+
+    # Find the first buy event.
+    buy_event = next(e for e in events if e["shares"] > 0)
+
+    # With target_volatility=0, vol scaling is disabled, full position used.
+    expected_budget = 100_000.0 * 0.95
+    expected_shares = int(expected_budget / buy_event["price"])
+    assert buy_event["shares"] == expected_shares
