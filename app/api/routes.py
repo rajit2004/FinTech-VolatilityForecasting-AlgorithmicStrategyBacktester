@@ -28,7 +28,7 @@ from app.data.database import (
     save_prices,
 )
 from app.data.fetcher import fetch_many, run_fetch_many_async
-from app.features.engineering import build_features
+from app.features.engineering import build_features, prepare_for_model
 from app.models.volatility_model import run_volatility_forecast
 from app.utils.logger import get_logger
 
@@ -201,6 +201,55 @@ def get_forecasts(symbol: str):
         return jsonify({"error": str(exc)}), 500
 
 
+@api_bp.route("/explain/<symbol>", methods=["GET"])
+def explain_model(symbol: str):
+    """Explain which features drive the random forest forecast.
+
+    Returns SHAP-based feature importance and per-row contributions.
+    Only works for the random forest model since tree SHAP is exact
+    and fast, while deep learning explainability requires different tools.
+    """
+    try:
+        horizon = int(request.args.get("horizon", 5))
+        data = load_prices(symbol)
+        if data.empty:
+            data = fetch_many([symbol])[symbol]
+            save_prices(symbol, data)
+
+        from app.models.explainer import explain_forecast
+        from app.models.volatility_model import (
+            RandomForestVolatilityModel,
+            train_test_split_time,
+        )
+
+        frame = build_features(data, horizon=horizon)
+        X, y, feature_names = prepare_for_model(frame)
+        X_train, X_test, y_train, y_test = train_test_split_time(X, y)
+
+        model = RandomForestVolatilityModel()
+        model.fit(X_train, y_train)
+        test_predictions = model.predict(X_test)
+
+        explanation = explain_forecast(
+            model, X_train, X_test, feature_names, test_predictions
+        )
+
+        return jsonify(
+            {
+                "symbol": symbol.upper(),
+                "model": "random_forest",
+                "feature_importance": _jsonable(explanation["feature_importance"]),
+                "latest_contributions": _jsonable(
+                    explanation["latest_prediction_contributions"]
+                ),
+                "summary": explanation["summary"],
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error("explain failed for %s: %s", symbol, exc)
+        return jsonify({"error": str(exc)}), 500
+
+
 @api_bp.route("/backtest", methods=["POST"])
 def backtest():
     """Run a backtest and store the results.
@@ -219,11 +268,16 @@ def backtest():
             data = fetch_many([parsed["symbol"]])[parsed["symbol"]]
             save_prices(parsed["symbol"], data)
 
+        from app.backtester.engine import BacktestConfig
+
+        config = BacktestConfig(**parsed["config"])
+
         result = run_backtest(
             symbol=parsed["symbol"],
             df=data,
             strategy_name=parsed["strategy_name"],
             params=parsed["params"],
+            config=config,
         )
         payload = result.to_dict()
         run_id = save_backtest(
