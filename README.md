@@ -47,6 +47,7 @@ The project does three big things:
 | --------------------- | ------------------------------ | ------------------------------------------- |
 | 🌲 **Random Forest**  | scikit-learn regressor         | A solid classical ML baseline that handles nonlinear patterns |
 | 🧠 **LSTM**           | Keras 3 (deep learning)        | A recurrent network built for time series   |
+| 📊 **GARCH(1,1)**     | arch library (statistical)     | The classic volatility baseline every ML model should beat |
 
 ### The trading strategies
 
@@ -62,8 +63,14 @@ The project does three big things:
 * 🧮 **Realized & EWMA Volatility**
   Rolling and exponentially weighted volatility, annualized and ready for the models.
 
-* 🤖 **Two Forecasting Models**
-  A random forest and an LSTM trained on the same features, compared on the same test period.
+* 🤖 **Three Forecasting Models**
+  A random forest, an LSTM and a GARCH baseline, all trained on the same data and compared on the same test period.
+
+* 🔍 **Model Explainability with SHAP**
+  SHAP feature importance shows which inputs drive the random forest predictions, so you know the model is not just memorizing noise.
+
+* 📉 **Volatility-Based Position Sizing**
+  When the forecast says volatility is high, the backtester automatically reduces the position size to protect capital.
 
 * 🧪 **Backtesting Engine**
   Simulates trades bar by bar with commission, and reports Sharpe ratio, max drawdown, win rate and profit factor.
@@ -103,13 +110,16 @@ Feature engineering: returns, realized & EWMA vol, RSI, ATR...
 Train / test split in time order (no peeking into the future)
         |
         v
-Random forest or LSTM forecasts next period volatility
+Random forest, LSTM or GARCH forecasts next period volatility
+        |
+        v
+SHAP explains which features drove the forecast
         |
         v
 Strategy generates buy / sell signals
         |
         v
-Backtester simulates trades with commission costs
+Backtester simulates trades with commission and vol-based sizing
         |
         v
 Metrics (Sharpe, drawdown, win rate) are stored and shown
@@ -127,6 +137,8 @@ Flask API serves JSON, dashboard renders the charts
 | **Language**           | Python 3.14                                   |
 | **Data handling**      | pandas, NumPy                                 |
 | **Classical ML**       | scikit-learn (RandomForestRegressor)          |
+| **Statistical ML**     | arch (GARCH volatility models)                |
+| **Model explainability** | shap (SHAP feature importance)              |
 | **Deep learning**      | Keras 3 with the JAX backend (LSTM)           |
 | **Data source**        | yfinance (with bundled CSV fallback)          |
 | **Database**           | PostgreSQL via SQLAlchemy                     |
@@ -150,9 +162,9 @@ capstone4-volatility-forecaster/
 |   |   +-- config.py          # loads settings from .env
 |   |   +-- data/              # fetcher (asyncio), cleaner, database
 |   |   +-- features/          # feature engineering, volatility targets
-|   |   +-- models/            # random forest, LSTM, evaluation
+|   |   +-- models/            # random forest, LSTM, GARCH, SHAP explainer
 |   |   +-- strategies/        # moving average, volatility breakout
-|   |   +-- backtester/        # engine and performance metrics
+|   |   +-- backtester/        # engine, performance metrics, vol sizing
 |   |   +-- api/               # Flask routes and request validation
 |   |   +-- utils/             # logger and custom decorators
 |   |
@@ -164,7 +176,7 @@ capstone4-volatility-forecaster/
 |   |   +-- fetch_and_seed.py         # generates data and loads it into the DB
 |   |   +-- demo_backtest.py          # quick command line comparison
 |   |
-|   +-- tests/                 # pytest suite
+|   +-- tests/                 # pytest suite (64 test cases)
 |   +-- docs/                  # research gap, system design, final report
 |   +-- notebooks/             # exploration notebook
 |   +-- dataset/               # generated sample CSVs (created on demand)
@@ -346,7 +358,7 @@ POST /api/forecast
 }
 ```
 
-`model_name` can be `random_forest` or `lstm`. The response includes the next period forecast, the test metrics (RMSE, MAE, R squared) and the test predictions.
+`model_name` can be `random_forest`, `lstm` or `garch`. The response includes the next period forecast, the test metrics (RMSE, MAE, R squared) and the test predictions.
 
 ---
 
@@ -357,6 +369,16 @@ GET /api/forecasts/{symbol}
 ```
 
 Optional `?model_name=lstm` filters by model.
+
+---
+
+## Explain Model Predictions
+
+```http
+GET /api/explain/{symbol}
+```
+
+Optional `?horizon=5` sets the forecast horizon. Returns SHAP-based feature importance showing which inputs drive the random forest predictions, along with the most recent prediction's top contributing features.
 
 ---
 
@@ -372,9 +394,17 @@ POST /api/backtest
 {
   "symbol": "AAPL",
   "strategy": "moving_average",
-  "params": { "fast": 10, "slow": 50 }
+  "params": { "fast": 10, "slow": 50 },
+  "config": {
+    "initial_capital": 100000,
+    "commission": 0.001,
+    "target_volatility": 0.15,
+    "forecast_volatility": 0.25
+  }
 }
 ```
+
+The `config` block is optional. When `target_volatility` and `forecast_volatility` are both provided, the backtester scales the position size by `min(target / forecast, 1.0)`, reducing exposure when the forecast says volatility is high.
 
 **Response**
 
@@ -420,8 +450,10 @@ Returns the run details together with every trade it produced.
 ```bash
 python -m app.main fetch --symbols AAPL,MSFT,BTC-USD
 python -m app.main forecast --symbol AAPL --model random_forest
+python -m app.main forecast --symbol AAPL --model garch
 python -m app.main backtest --symbol AAPL --strategy moving_average
 python -m app.main backtest --symbol AAPL --strategy volatility_breakout
+python -m app.main backtest --symbol AAPL --strategy moving_average --target-vol 0.15 --forecast-vol 0.25
 ```
 
 ---
@@ -442,7 +474,7 @@ Prints a side by side comparison of both strategies on one symbol.
 python -m pytest -v
 ```
 
-The suite runs fully offline on seeded synthetic data against an isolated temporary database (the tests do not need your PostgreSQL server). Around 50 test cases cover normal inputs, invalid inputs and edge cases.
+The suite runs fully offline on seeded synthetic data against an isolated temporary database (the tests do not need your PostgreSQL server). 64 test cases cover normal inputs, invalid inputs, edge cases, the GARCH baseline, SHAP explainability and volatility-based position sizing.
 
 ## Data Sources
 
@@ -490,6 +522,8 @@ Distributed under the **MIT License**.
 
 * **yfinance** : free market data downloads
 * **scikit-learn** : the random forest regressor
+* **arch** : GARCH volatility models for statistical baselines
+* **shap** : model explainability through SHAP values
 * **Keras + JAX** : the LSTM backend that works on Python 3.14
 * **Flask** : the REST API layer
 * **SQLAlchemy** : clean database access
