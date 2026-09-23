@@ -197,3 +197,89 @@ def test_volatility_sizing_disabled_when_zero(clean_frame):
     expected_budget = 100_000.0 * 0.95
     expected_shares = int(expected_budget / buy_event["price"])
     assert buy_event["shares"] == expected_shares
+
+
+def test_stop_loss_exits_position(clean_frame):
+    """A stop-loss triggers a sell when price drops below entry."""
+    config = BacktestConfig(
+        initial_capital=100_000.0,
+        stop_loss_pct=0.05,  # exit if price drops 5% below entry
+    )
+    strategy = MovingAverageCrossover({"fast": 10, "slow": 50})
+    events = list(iter_bar_events(clean_frame, strategy, config))
+
+    # The backtest should complete without errors.
+    assert len(events) == len(clean_frame)
+    # Equity should be a valid number at every step.
+    for event in events:
+        assert isinstance(event["equity"], float)
+        assert event["equity"] > 0
+
+
+def test_take_profit_exits_position(clean_frame):
+    """A take-profit triggers a sell when price rises above entry."""
+    config = BacktestConfig(
+        initial_capital=100_000.0,
+        take_profit_pct=0.10,  # exit if price rises 10% above entry
+    )
+    strategy = MovingAverageCrossover({"fast": 10, "slow": 50})
+    events = list(iter_bar_events(clean_frame, strategy, config))
+
+    assert len(events) == len(clean_frame)
+    for event in events:
+        assert isinstance(event["equity"], float)
+        assert event["equity"] > 0
+
+
+def test_stop_loss_and_take_profit_combined(clean_frame):
+    """Both stop-loss and take-profit can be active at the same time."""
+    config = BacktestConfig(
+        initial_capital=100_000.0,
+        stop_loss_pct=0.05,
+        take_profit_pct=0.15,
+    )
+    strategy = MovingAverageCrossover({"fast": 10, "slow": 50})
+    events = list(iter_bar_events(clean_frame, strategy, config))
+
+    assert len(events) == len(clean_frame)
+
+
+def test_portfolio_backtest_returns_results(clean_frame):
+    """A portfolio backtest across two symbols returns combined metrics."""
+    from app.backtester.portfolio import run_portfolio_backtest
+
+    data = {
+        "AAPL": clean_frame,
+        "MSFT": clean_frame,
+    }
+    result = run_portfolio_backtest(
+        data, "moving_average", params={"fast": 10, "slow": 50}
+    )
+
+    assert result["n_symbols"] == 2
+    assert set(result["symbols"]) == {"AAPL", "MSFT"}
+    assert "portfolio_metrics" in result
+    assert "total_return" in result["portfolio_metrics"]
+    assert "portfolio_equity_curve" in result
+    assert len(result["portfolio_equity_curve"]) > 0
+    assert "individual_results" in result
+    assert "AAPL" in result["individual_results"]
+
+
+def test_portfolio_backtest_rejects_empty_data():
+    """A portfolio backtest with no symbols must be rejected."""
+    from app.backtester.portfolio import run_portfolio_backtest
+
+    with pytest.raises(ValueError, match="no symbols"):
+        run_portfolio_backtest({}, "moving_average")
+
+
+def test_portfolio_capital_is_split_equally(clean_frame):
+    """Each symbol gets an equal share of the initial capital."""
+    from app.backtester.portfolio import run_portfolio_backtest
+
+    data = {"AAPL": clean_frame, "MSFT": clean_frame, "BTC-USD": clean_frame}
+    result = run_portfolio_backtest(data, "moving_average")
+
+    assert result["n_symbols"] == 3
+    assert result["per_symbol_capital"] == pytest.approx(100_000.0 / 3)

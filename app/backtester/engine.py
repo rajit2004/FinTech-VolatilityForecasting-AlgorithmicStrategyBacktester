@@ -36,6 +36,8 @@ class BacktestConfig:
     slippage: float = 0.0  # per share price slippage, zero for simplicity
     target_volatility: float = 0.0  # if > 0, scale position size by forecast vol
     forecast_volatility: float = 0.0  # the forecast volatility to scale against
+    stop_loss_pct: float = 0.0  # sell if price drops this fraction below entry (0=disabled)
+    take_profit_pct: float = 0.0  # sell if price rises this fraction above entry (0=disabled)
 
 
 @dataclass
@@ -108,10 +110,26 @@ def iter_bar_events(
     shares = 0
     position = 0  # current actual position, updated on trades
     cost_basis = 0.0  # total paid for the shares we currently hold
+    entry_price = 0.0  # price at which we entered, for stop-loss/take-profit
 
     for date, row in df.iterrows():
         price = float(row["close"])
         desired = float(signals.loc[date])
+
+        # Stop-loss and take-profit checks. These override the strategy
+        # signal: if we are long and price hits a risk limit, we exit
+        # regardless of what the strategy wants.
+        if shares > 0 and entry_price > 0:
+            # Stop-loss: price fell too far below our entry.
+            if config.stop_loss_pct > 0:
+                stop_price = entry_price * (1.0 - config.stop_loss_pct)
+                if price <= stop_price:
+                    desired = 0.0  # force a sell
+            # Take-profit: price rose enough above our entry.
+            if config.take_profit_pct > 0 and shares > 0:
+                target_price = entry_price * (1.0 + config.take_profit_pct)
+                if price >= target_price:
+                    desired = 0.0  # force a sell
 
         # Trade only when the strategy changes its mind.
         if desired != position:
@@ -131,6 +149,7 @@ def iter_bar_events(
                     fee = cost * config.commission
                     cash -= cost + fee
                     cost_basis = cost + fee
+                    entry_price = price
             elif desired == 0 and shares > 0:
                 # Sell everything we hold and book the round trip pnl.
                 proceeds = shares * price
@@ -138,6 +157,7 @@ def iter_bar_events(
                 cash += proceeds - fee
                 pnl = proceeds - fee - cost_basis
                 cost_basis = 0.0
+                entry_price = 0.0
             position = desired
             shares = shares if desired > 0 else 0
 
