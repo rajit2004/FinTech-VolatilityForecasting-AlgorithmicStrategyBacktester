@@ -16,8 +16,9 @@ from app.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-VALID_MODELS = ("random_forest", "lstm", "garch")
+VALID_MODELS = ("random_forest", "lstm", "garch", "transformer")
 VALID_STRATEGIES = ("moving_average", "volatility_breakout")
+VALID_VALIDATION = ("holdout", "walk_forward")
 
 
 def _require_text(payload: Dict[str, Any], key: str) -> str:
@@ -83,7 +84,7 @@ def parse_forecast_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Validate a volatility forecast request.
 
     Returns:
-        A dict with symbol, model_name and horizon keys.
+        A dict with symbol, model_name, horizon and validation keys.
     """
     symbol = validate_symbol(_require_text(payload, "symbol"))
 
@@ -95,7 +96,21 @@ def parse_forecast_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(horizon, int) or horizon < 1:
         raise ValueError("horizon must be a positive integer")
 
-    return {"symbol": symbol, "model_name": model_name, "horizon": horizon}
+    validation = payload.get("validation", "holdout")
+    if validation not in VALID_VALIDATION:
+        raise ValueError(f"validation must be one of {list(VALID_VALIDATION)}")
+
+    n_folds = payload.get("n_walk_forward_folds", 5)
+    if not isinstance(n_folds, int) or n_folds < 2:
+        raise ValueError("n_walk_forward_folds must be an integer of at least 2")
+
+    return {
+        "symbol": symbol,
+        "model_name": model_name,
+        "horizon": horizon,
+        "validation": validation,
+        "n_walk_forward_folds": n_folds,
+    }
 
 
 def parse_backtest_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -127,6 +142,13 @@ def parse_backtest_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(commission, (int, float)) or commission < 0:
         raise ValueError("commission must be zero or a positive number")
 
+    stop_loss_pct = config_payload.get("stop_loss_pct", 0.0)
+    take_profit_pct = config_payload.get("take_profit_pct", 0.0)
+    if not isinstance(stop_loss_pct, (int, float)) or stop_loss_pct < 0:
+        raise ValueError("stop_loss_pct must be zero or a positive number")
+    if not isinstance(take_profit_pct, (int, float)) or take_profit_pct < 0:
+        raise ValueError("take_profit_pct must be zero or a positive number")
+
     return {
         "symbol": symbol,
         "strategy_name": strategy_name,
@@ -136,5 +158,7 @@ def parse_backtest_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             "commission": commission,
             "target_volatility": config_payload.get("target_volatility", 0.0),
             "forecast_volatility": config_payload.get("forecast_volatility", 0.0),
+            "stop_loss_pct": stop_loss_pct,
+            "take_profit_pct": take_profit_pct,
         },
     }

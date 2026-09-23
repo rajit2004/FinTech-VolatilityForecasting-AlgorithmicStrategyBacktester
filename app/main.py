@@ -87,10 +87,14 @@ def _forecast_command(args: argparse.Namespace) -> None:
         data,
         horizon=args.horizon,
         model_name=args.model,
+        validation=args.validation,
     )
     print(f"model: {result['model_name']}, horizon: {result['horizon']} days")
+    print(f"validation: {result.get('validation', 'holdout')}")
     print(f"next forecast: {result['next_forecast']:.4f}")
     print(f"test metrics: {result['metrics']}")
+    if "fold_metrics" in result:
+        print(f"walk-forward folds: {len(result['fold_metrics'])}")
 
 
 def _backtest_command(args: argparse.Namespace) -> None:
@@ -101,6 +105,8 @@ def _backtest_command(args: argparse.Namespace) -> None:
     config = BacktestConfig(
         target_volatility=args.target_vol,
         forecast_volatility=args.forecast_vol,
+        stop_loss_pct=args.stop_loss,
+        take_profit_pct=args.take_profit,
     )
     result = run_backtest(
         symbol=args.symbol,
@@ -117,6 +123,51 @@ def _backtest_command(args: argparse.Namespace) -> None:
             print(f"  {key}: {value}")
 
 
+def _regime_command(args: argparse.Namespace) -> None:
+    """Detect and print the current market regime."""
+    from app.models.regime import detect_regimes
+
+    data = fetch_many([args.symbol])[args.symbol]
+    result = detect_regimes(data)
+    print(f"symbol: {args.symbol.upper()}")
+    print(f"current regime: {result['regime_name']} (id={result['regime_id']})")
+    print(f"regime volatility means: {[round(m, 4) for m in result['regime_vol_means']]}")
+    counts = result["label_counts"]
+    print(f"regime distribution: {dict(counts)}")
+
+
+def _portfolio_command(args: argparse.Namespace) -> None:
+    """Run a multi-asset portfolio backtest and print results."""
+    from app.backtester.portfolio import run_portfolio_backtest
+
+    symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    data = {}
+    for symbol in symbols:
+        try:
+            data[symbol] = fetch_many([symbol])[symbol]
+        except Exception as exc:  # noqa: BLE001
+            print(f"  skipping {symbol}: {exc}")
+
+    if not data:
+        print("No symbols could be fetched")
+        return
+
+    result = run_portfolio_backtest(data, args.strategy)
+    print(f"Portfolio backtest: {args.strategy} on {result['symbols']}")
+    print(f"Capital per symbol: ${result['per_symbol_capital']:,.2f}")
+    print("Portfolio metrics:")
+    for key, value in result["portfolio_metrics"].items():
+        if isinstance(value, float):
+            print(f"  {key}: {value:.4f}")
+        else:
+            print(f"  {key}: {value}")
+    print("\nPer-symbol results:")
+    for sym, info in result["individual_results"].items():
+        print(f"  {sym}: return={info['metrics']['total_return']:.2%}, "
+              f"sharpe={info['metrics']['sharpe_ratio']:.2f}, "
+              f"trades={info['num_trades']}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the command line parser."""
     parser = argparse.ArgumentParser(description="Volatility forecaster CLI")
@@ -130,8 +181,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     forecast = sub.add_parser("forecast", help="train and forecast volatility")
     forecast.add_argument("--symbol", required=True)
-    forecast.add_argument("--model", default="random_forest", choices=["random_forest", "lstm", "garch"])
+    forecast.add_argument("--model", default="random_forest", choices=["random_forest", "lstm", "garch", "transformer"])
     forecast.add_argument("--horizon", type=int, default=5)
+    forecast.add_argument("--validation", default="holdout", choices=["holdout", "walk_forward"])
     forecast.set_defaults(func=_forecast_command)
 
     backtest = sub.add_parser("backtest", help="run a strategy backtest")
@@ -139,7 +191,18 @@ def build_parser() -> argparse.ArgumentParser:
     backtest.add_argument("--strategy", default="moving_average")
     backtest.add_argument("--target-vol", type=float, default=0.0, help="target volatility for position sizing (0=disabled)")
     backtest.add_argument("--forecast-vol", type=float, default=0.0, help="forecast volatility to scale against")
+    backtest.add_argument("--stop-loss", type=float, default=0.0, help="stop loss as fraction below entry (0=disabled)")
+    backtest.add_argument("--take-profit", type=float, default=0.0, help="take profit as fraction above entry (0=disabled)")
     backtest.set_defaults(func=_backtest_command)
+
+    regime = sub.add_parser("regime", help="detect market regime")
+    regime.add_argument("--symbol", required=True)
+    regime.set_defaults(func=_regime_command)
+
+    portfolio = sub.add_parser("portfolio", help="run multi-asset portfolio backtest")
+    portfolio.add_argument("--symbols", default="AAPL,MSFT,BTC-USD")
+    portfolio.add_argument("--strategy", default="moving_average")
+    portfolio.set_defaults(func=_portfolio_command)
 
     return parser
 

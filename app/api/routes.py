@@ -158,6 +158,8 @@ def forecast():
             data,
             horizon=parsed["horizon"],
             model_name=parsed["model_name"],
+            validation=parsed["validation"],
+            n_walk_forward_folds=parsed["n_walk_forward_folds"],
         )
 
         # The forecast is for the period right after the last known day.
@@ -247,6 +249,93 @@ def explain_model(symbol: str):
         )
     except Exception as exc:  # noqa: BLE001
         logger.error("explain failed for %s: %s", symbol, exc)
+        return jsonify({"error": str(exc)}), 500
+
+
+@api_bp.route("/regime/<symbol>", methods=["GET"])
+def get_regime(symbol: str):
+    """Detect the current market regime for a symbol.
+
+    Classifies the market as calm, normal or volatile using a
+    Gaussian Mixture Model on rolling volatility.
+    """
+    try:
+        data = load_prices(symbol)
+        if data.empty:
+            data = fetch_many([symbol])[symbol]
+            save_prices(symbol, data)
+
+        from app.models.regime import detect_regimes
+
+        result = detect_regimes(data)
+        labels = result.pop("labels")
+
+        return jsonify(
+            {
+                "symbol": symbol.upper(),
+                "regime_id": result["regime_id"],
+                "regime_name": result["regime_name"],
+                "regime_vol_means": result["regime_vol_means"],
+                "label_counts": {str(k): int(v) for k, v in result["label_counts"].items()},
+                "regime_series": [
+                    {"date": idx.date().isoformat(), "regime": int(val)}
+                    for idx, val in labels.items()
+                ],
+            }
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error("regime detection failed for %s: %s", symbol, exc)
+        return jsonify({"error": str(exc)}), 500
+
+
+@api_bp.route("/portfolio/backtest", methods=["POST"])
+def portfolio_backtest():
+    """Run a backtest across multiple symbols as a portfolio.
+
+    Example payload:
+        {"symbols": ["AAPL", "MSFT"], "strategy": "moving_average",
+         "params": {"fast": 10, "slow": 50}}
+    """
+    try:
+        payload = request.get_json(force=True)
+    except Exception:
+        return jsonify({"error": "invalid JSON"}), 400
+
+    try:
+        from app.api.schemas import parse_symbols
+        from app.backtester.portfolio import run_portfolio_backtest
+
+        symbols = parse_symbols(payload)
+        strategy_name = payload.get("strategy", "moving_average")
+        if strategy_name not in ("moving_average", "volatility_breakout"):
+            raise ValueError(f"strategy must be one of moving_average, volatility_breakout")
+        params = payload.get("params") or {}
+
+        data = {}
+        for sym in symbols:
+            frame = load_prices(sym)
+            if frame.empty:
+                frame = fetch_many([sym])[sym]
+                save_prices(sym, frame)
+            data[sym] = frame
+
+        result = run_portfolio_backtest(data, strategy_name, params=params)
+
+        return jsonify(
+            {
+                "symbols": result["symbols"],
+                "n_symbols": result["n_symbols"],
+                "strategy_name": result["strategy_name"],
+                "per_symbol_capital": result["per_symbol_capital"],
+                "portfolio_metrics": _jsonable(result["portfolio_metrics"]),
+                "portfolio_equity_curve": result["portfolio_equity_curve"],
+                "individual_results": _jsonable(result["individual_results"]),
+            }
+        )
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001
+        logger.error("portfolio backtest failed: %s", exc)
         return jsonify({"error": str(exc)}), 500
 
 
