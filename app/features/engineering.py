@@ -40,6 +40,7 @@ FEATURE_COLUMNS = [
     "momentum",
     "volume_ratio",
     "day_of_week",
+    "sentiment",
 ]
 
 
@@ -291,6 +292,13 @@ def build_features(
     )
     result["volume_ratio"] = result["volume"] / result["volume"].rolling(20).mean()
     result["day_of_week"] = result.index.dayofweek
+
+    # Sentiment features from price action (offline-friendly approach).
+    # Research shows sentiment has predictive power for volatility.
+    from app.features.sentiment import simulate_sentiment
+    result["sentiment"] = simulate_sentiment(
+        result["close"], result["volume"], window=volatility_window
+    )
 
     # The target is the volatility over the NEXT horizon days.
     result["target"] = future_realized_volatility(

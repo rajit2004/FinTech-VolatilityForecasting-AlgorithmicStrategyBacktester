@@ -87,6 +87,7 @@ def test_build_features_produces_expected_columns(clean_frame):
         "momentum",
         "volume_ratio",
         "day_of_week",
+        "sentiment",
         "target",
     ]
     for column in expected:
@@ -113,7 +114,7 @@ def test_prepare_for_model_drops_nan_rows(clean_frame):
     X, y, names = prepare_for_model(features)
 
     assert X.shape[0] == y.shape[0]
-    assert X.shape[1] == len(names) == 9
+    assert X.shape[1] == len(names) == 10
     assert not np.isnan(X).any()
     assert not np.isnan(y).any()
 
@@ -136,3 +137,40 @@ def test_make_lstm_sequences_needs_enough_rows():
     y = np.zeros(4)
     with pytest.raises(ValueError):
         make_lstm_sequences(X, y, sequence_length=5)
+
+
+def test_simulated_sentiment_range(clean_frame):
+    """Simulated sentiment scores stay within [-1, 1]."""
+    from app.features.sentiment import simulate_sentiment
+
+    scores = simulate_sentiment(clean_frame["close"], clean_frame["volume"])
+
+    assert len(scores) == len(clean_frame)
+    assert scores.min() >= -1.0
+    assert scores.max() <= 1.0
+
+
+def test_score_text_sentiment():
+    """Lexicon scorer gives positive scores for bullish text."""
+    from app.features.sentiment import score_text_sentiment
+
+    scores = score_text_sentiment([
+        "Stocks rally on strong earnings",
+        "Market crashes amid panic selling",
+        "Weather is nice today",
+    ])
+
+    assert scores[0] > 0  # bullish words
+    assert scores[1] < 0  # bearish words
+    assert scores[2] == 0.0  # no known words, neutral
+
+
+def test_add_sentiment_features(clean_frame):
+    """add_sentiment_features adds sentiment columns to the frame."""
+    from app.features.sentiment import add_sentiment_features
+
+    result = add_sentiment_features(clean_frame)
+
+    assert "sentiment" in result.columns
+    assert "sentiment_momentum" in result.columns
+    assert len(result) == len(clean_frame)
