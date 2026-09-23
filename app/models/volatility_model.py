@@ -196,6 +196,131 @@ class LSTMVolatilityModel:
         return self._target_scaler.inverse_transform(raw).ravel()
 
 
+class TransformerVolatilityModel:
+    """Attention-based transformer for volatility forecasting.
+
+    Transformers use self-attention to weigh the importance of every
+    time step against every other time step. Unlike the LSTM, which
+    processes steps sequentially and can forget early information,
+    attention lets the model look directly at any past observation.
+
+    Recent research (2024-2025) shows transformers outperform LSTMs
+    on financial time series because volatility patterns can span
+    long ranges that recurrent networks struggle to capture.
+
+    The architecture: multi-head attention over the input sequence,
+    followed by global average pooling and dense layers. We keep it
+    deliberately small to train quickly on a laptop.
+    """
+
+    def __init__(
+        self,
+        sequence_length: int = LSTM_SEQUENCE_LENGTH,
+        epochs: int = LSTM_EPOCHS,
+        batch_size: int = 32,
+        num_heads: int = 4,
+        key_dim: int = 32,
+    ):
+        self.name = "transformer"
+        self.sequence_length = sequence_length
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.num_heads = num_heads
+        self.key_dim = key_dim
+        self.model = None
+        self._feature_scaler = None
+        self._target_scaler = None
+
+    def _build(self, n_features: int):
+        """Create the Keras model with multi-head attention.
+
+        Uses the Functional API instead of Sequential because
+        MultiHeadAttention takes both query and value as inputs, which
+        Sequential cannot handle. Structure: project features to a
+        higher dimension, apply multi-head self-attention over the
+        time axis, pool the result, then dense layers that shrink to
+        a single volatility number.
+        """
+        from keras import Input, Model
+        from keras.layers import (
+            Dense,
+            GlobalAveragePooling1D,
+            LayerNormalization,
+            MultiHeadAttention,
+            Dropout,
+        )
+
+        inputs = Input(shape=(self.sequence_length, n_features))
+        # Project features to a space suitable for attention.
+        x = Dense(self.key_dim * self.num_heads, activation="relu")(inputs)
+        # Multi-head attention: each head learns a different aspect of
+        # which time steps matter most. Query and value both come from x.
+        x = MultiHeadAttention(
+            num_heads=self.num_heads,
+            key_dim=self.key_dim,
+        )(query=x, value=x)
+        # Normalize to keep training stable.
+        x = LayerNormalization(epsilon=1e-6)(x)
+        # Pool the sequence into a single vector.
+        x = GlobalAveragePooling1D()(x)
+        x = Dropout(0.1)(x)
+        x = Dense(32, activation="relu")(x)
+        outputs = Dense(1)(x)
+
+        self.model = Model(inputs=inputs, outputs=outputs)
+        self.model.compile(optimizer="adam", loss="mse", metrics=["mae"])
+
+    def fit(self, X_seq: np.ndarray, y: np.ndarray) -> "TransformerVolatilityModel":
+        """Train the transformer on pre built sequences.
+
+        Args:
+            X_seq: 3D array shaped (samples, sequence_length, features).
+            y: 1D array of target values.
+
+        Returns:
+            self so calls can be chained.
+        """
+        from sklearn.preprocessing import MinMaxScaler
+
+        flat = X_seq.reshape(-1, X_seq.shape[2])
+        self._feature_scaler = MinMaxScaler().fit(flat)
+        scaled_flat = self._feature_scaler.transform(flat)
+        scaled_seq = scaled_flat.reshape(X_seq.shape)
+
+        self._target_scaler = MinMaxScaler().fit(y.reshape(-1, 1))
+        scaled_y = self._target_scaler.transform(y.reshape(-1, 1)).ravel()
+
+        self._build(X_seq.shape[2])
+        self.model.fit(
+            scaled_seq.astype("float32"),
+            scaled_y.astype("float32"),
+            epochs=self.epochs,
+            batch_size=self.batch_size,
+            verbose=0,
+        )
+        logger.info(
+            "Transformer trained with %d epochs, %d heads, seq length %d",
+            self.epochs,
+            self.num_heads,
+            self.sequence_length,
+        )
+        return self
+
+    def predict(self, X_seq: np.ndarray) -> np.ndarray:
+        """Predict volatility from sequences.
+
+        Args:
+            X_seq: 3D array shaped (samples, sequence_length, features).
+
+        Returns:
+            Array of predicted volatility values in the original scale.
+        """
+        flat = X_seq.reshape(-1, X_seq.shape[2])
+        scaled = self._feature_scaler.transform(flat).reshape(X_seq.shape)
+        raw = self.model.predict(scaled.astype("float32"), verbose=0)
+        return self._target_scaler.inverse_transform(raw).ravel()
+
+
 class GARCHVolatilityModel:
     """GARCH(1,1) baseline for volatility forecasting.
 
@@ -313,12 +438,99 @@ def train_test_split_time(
     return X[:split], X[split:], y[:split], y[split:]
 
 
+def walk_forward_validate(
+    X: np.ndarray,
+    y: np.ndarray,
+    model_factory,
+    n_splits: int = 5,
+    min_train_fraction: float = 0.4,
+) -> dict:
+    """Walk-forward validation for time series models.
+
+    Instead of a single train/test split, this trains the model on a
+    rolling window and tests on the next chunk, then slides the window
+    forward and repeats. This gives a much more honest picture of how
+    the model performs across different market conditions.
+
+    The approach: start with the first min_train_fraction of data as
+    the initial training set. Split the remaining data into n_splits
+    equal chunks. For each chunk, train on everything before it and
+    test on that chunk. Collect predictions from all chunks.
+
+    Args:
+        X: feature array (2D for RF, 3D for sequence models).
+        y: target array.
+        model_factory: a callable that returns a fresh model instance.
+            Must have fit(X, y) and predict(X) methods.
+        n_splits: number of test chunks to evaluate on.
+        min_train_fraction: minimum fraction of data used for the
+            first training set.
+
+    Returns:
+        A dict with all_predictions, all_true, all_dates indices, and
+        per fold metrics plus aggregate metrics.
+    """
+    n = len(X)
+    initial_split = int(n * min_train_fraction)
+    remaining = n - initial_split
+    if remaining < n_splits:
+        raise ValueError(
+            f"Not enough data for {n_splits} walk-forward splits, "
+            f"got {remaining} rows after initial training window"
+        )
+
+    chunk_size = remaining // n_splits
+
+    all_predictions = []
+    all_true = []
+    fold_metrics = []
+
+    for fold in range(n_splits):
+        train_end = initial_split + fold * chunk_size
+        test_end = train_end + chunk_size if fold < n_splits - 1 else n
+
+        X_train = X[:train_end]
+        y_train = y[:train_end]
+        X_test = X[train_end:test_end]
+        y_test = y[train_end:test_end]
+
+        if len(X_test) == 0:
+            continue
+
+        model = model_factory()
+        model.fit(X_train, y_train)
+        predictions = model.predict(X_test)
+
+        all_predictions.extend(predictions.tolist())
+        all_true.extend(y_test.tolist())
+
+        fold_metrics.append(evaluate_predictions(y_test, predictions))
+        logger.info(
+            "Walk-forward fold %d/%d: RMSE=%.4f, R2=%.4f",
+            fold + 1, n_splits,
+            fold_metrics[-1]["rmse"],
+            fold_metrics[-1]["r2"],
+        )
+
+    aggregate = evaluate_predictions(np.array(all_true), np.array(all_predictions))
+
+    return {
+        "all_predictions": all_predictions,
+        "all_true": all_true,
+        "test_start_index": initial_split,
+        "fold_metrics": fold_metrics,
+        "aggregate_metrics": aggregate,
+    }
+
+
 def run_volatility_forecast(
     df: pd.DataFrame,
     horizon: int = FORECAST_HORIZON_DAYS,
     model_name: str = "random_forest",
     sequence_length: Optional[int] = None,
     epochs: Optional[int] = None,
+    validation: str = "holdout",
+    n_walk_forward_folds: int = 5,
 ) -> dict:
     """Run the whole forecasting pipeline for one symbol.
 
@@ -329,17 +541,23 @@ def run_volatility_forecast(
     Args:
         df: cleaned OHLCV data indexed by date.
         horizon: forecast horizon in days.
-        model_name: 'random_forest' or 'lstm'.
+        model_name: 'random_forest', 'lstm' or 'garch'.
         sequence_length: LSTM window, only used for the lstm model.
         epochs: LSTM epochs, only used for the lstm model.
+        validation: 'holdout' for a single 80/20 split, or
+            'walk_forward' for rolling window validation.
+        n_walk_forward_folds: number of walk-forward folds when
+            validation is 'walk_forward'.
 
     Returns:
         A dict with predictions, true values, metrics and the next
         forecast, ready to store in the database and return via the API.
     """
-    valid_models = ("random_forest", "lstm", "garch")
+    valid_models = ("random_forest", "lstm", "garch", "transformer")
     if model_name not in valid_models:
         raise ValueError(f"Unknown model: {model_name}")
+    if validation not in ("holdout", "walk_forward"):
+        raise ValueError(f"Unknown validation mode: {validation}")
 
     frame = build_features(df, horizon)
     clean = frame.dropna(subset=FEATURE_COLUMNS + ["target"])
@@ -388,6 +606,7 @@ def run_volatility_forecast(
             "model_name": model_name,
             "horizon": horizon,
             "feature_names": [],
+            "validation": validation,
             "test_predictions": test_predictions.tolist(),
             "test_true": true_vol.tolist(),
             "test_dates": test_dates,
@@ -399,6 +618,65 @@ def run_volatility_forecast(
     X, y, feature_names = prepare_for_model(frame)
     logger.info("Prepared %d samples with %d features", len(X), len(feature_names))
 
+    # Walk-forward validation: train on rolling windows, test on next chunk.
+    if validation == "walk_forward":
+        if model_name == "random_forest":
+            factory = lambda: RandomForestVolatilityModel()  # noqa: E731
+            wf = walk_forward_validate(X, y, factory, n_splits=n_walk_forward_folds)
+        else:
+            seq_len = sequence_length or LSTM_SEQUENCE_LENGTH
+            epochs_val = epochs or LSTM_EPOCHS
+            X_seq, y_seq = make_lstm_sequences(X, y, seq_len)
+            if model_name == "transformer":
+                factory = lambda: TransformerVolatilityModel(  # noqa: E731
+                    sequence_length=seq_len, epochs=epochs_val
+                )
+            else:
+                factory = lambda: LSTMVolatilityModel(  # noqa: E731
+                    sequence_length=seq_len, epochs=epochs_val
+                )
+            wf = walk_forward_validate(
+                X_seq, y_seq, factory, n_splits=n_walk_forward_folds
+            )
+
+        # Final model trained on all data for the next period forecast.
+        if model_name == "random_forest":
+            final_model = RandomForestVolatilityModel()
+            final_model.fit(X, y)
+            next_forecast = float(final_model.predict(X[-1:])[0])
+            split_idx = wf["test_start_index"]
+            test_dates = [d.date().isoformat() for d in dates[split_idx:]]
+        else:
+            if model_name == "transformer":
+                final_model = TransformerVolatilityModel(
+                    sequence_length=seq_len, epochs=epochs_val
+                )
+            else:
+                final_model = LSTMVolatilityModel(
+                    sequence_length=seq_len, epochs=epochs_val
+                )
+            final_model.fit(X_seq, y_seq)
+            next_forecast = float(final_model.predict(X_seq[-1:])[0])
+            split_seq = wf["test_start_index"]
+            test_dates = [
+                d.date().isoformat()
+                for d in dates[split_seq + seq_len - 1 : len(dates) - 1]
+            ]
+
+        return {
+            "model_name": model_name,
+            "horizon": horizon,
+            "feature_names": feature_names,
+            "validation": validation,
+            "test_predictions": wf["all_predictions"],
+            "test_true": wf["all_true"],
+            "test_dates": test_dates[: len(wf["all_predictions"])],
+            "metrics": wf["aggregate_metrics"],
+            "fold_metrics": wf["fold_metrics"],
+            "next_forecast": next_forecast,
+        }
+
+    # Standard holdout validation: single 80/20 time split.
     if model_name == "random_forest":
         X_train, X_test, y_train, y_test = train_test_split_time(X, y)
         model = RandomForestVolatilityModel()
@@ -412,7 +690,11 @@ def run_volatility_forecast(
 
         X_seq, y_seq = make_lstm_sequences(X, y, seq_len)
         X_train, X_test, y_train, y_test = train_test_split_time(X_seq, y_seq)
-        model = LSTMVolatilityModel(sequence_length=seq_len, epochs=epochs)
+
+        if model_name == "transformer":
+            model = TransformerVolatilityModel(sequence_length=seq_len, epochs=epochs)
+        else:
+            model = LSTMVolatilityModel(sequence_length=seq_len, epochs=epochs)
         model.fit(X_train, y_train)
         test_predictions = model.predict(X_test)
         # The final sequence predicts the period after the last known day.
@@ -438,6 +720,7 @@ def run_volatility_forecast(
         "model_name": model_name,
         "horizon": horizon,
         "feature_names": feature_names,
+        "validation": validation,
         "test_predictions": test_predictions.tolist(),
         "test_true": y_test.tolist(),
         "test_dates": test_dates,

@@ -198,3 +198,96 @@ def test_shap_explain_forecast(clean_frame):
     assert "latest_prediction_contributions" in result
     assert "summary" in result
     assert len(result["summary"]) > 0
+
+
+def test_walk_forward_validate_produces_folds(clean_frame):
+    """Walk-forward validation produces predictions from multiple folds."""
+    from app.models.volatility_model import walk_forward_validate
+
+    features = build_features(clean_frame, horizon=5)
+    X, y, _ = prepare_for_model(features)
+
+    factory = lambda: RandomForestVolatilityModel(n_estimators=30, max_depth=6)  # noqa: E731
+    result = walk_forward_validate(X, y, factory, n_splits=3)
+
+    assert "all_predictions" in result
+    assert "all_true" in result
+    assert "aggregate_metrics" in result
+    assert len(result["fold_metrics"]) == 3
+    assert len(result["all_predictions"]) == len(result["all_true"])
+    assert "rmse" in result["aggregate_metrics"]
+
+
+def test_run_volatility_forecast_walk_forward(clean_frame):
+    """The full pipeline works with walk-forward validation."""
+    result = run_volatility_forecast(
+        clean_frame, horizon=5, model_name="random_forest",
+        validation="walk_forward", n_walk_forward_folds=3,
+    )
+
+    assert result["validation"] == "walk_forward"
+    assert "fold_metrics" in result
+    assert len(result["fold_metrics"]) == 3
+    assert "rmse" in result["metrics"]
+    assert isinstance(result["next_forecast"], float)
+
+
+def test_run_volatility_forecast_rejects_unknown_validation(clean_frame):
+    """An unknown validation mode must raise a clear error."""
+    with pytest.raises(ValueError, match="Unknown validation"):
+        run_volatility_forecast(clean_frame, validation="cross_validation")
+
+
+def test_transformer_fit_and_predict_shapes(clean_frame):
+    """The transformer trains on sequences and predicts correctly."""
+    from app.models.volatility_model import TransformerVolatilityModel
+
+    features = build_features(clean_frame, horizon=5)
+    X, y, _ = prepare_for_model(features)
+    X_seq, y_seq = make_lstm_sequences(X, y, sequence_length=15)
+
+    model = TransformerVolatilityModel(
+        sequence_length=15, epochs=1, batch_size=64, num_heads=2, key_dim=16
+    )
+    model.fit(X_seq[:150], y_seq[:150])
+    predictions = model.predict(X_seq[150:160])
+
+    assert predictions.shape == (10,)
+    assert np.all(np.isfinite(predictions))
+
+
+def test_run_volatility_forecast_transformer(clean_frame):
+    """The full pipeline works with the transformer model."""
+    result = run_volatility_forecast(
+        clean_frame, horizon=5, model_name="transformer",
+        sequence_length=15, epochs=1,
+    )
+
+    assert result["model_name"] == "transformer"
+    assert "rmse" in result["metrics"]
+    assert isinstance(result["next_forecast"], float)
+    assert len(result["test_predictions"]) == len(result["test_true"])
+
+
+def test_regime_detection(clean_frame):
+    """Regime detection labels each day and returns latest regime."""
+    from app.models.regime import detect_regimes
+
+    result = detect_regimes(clean_frame)
+
+    assert "regime_id" in result
+    assert "regime_name" in result
+    assert result["regime_name"] in ("calm", "normal", "volatile")
+    assert "labels" in result
+    assert len(result["labels"]) == len(clean_frame)
+    # Labels should only be valid regime ids.
+    assert result["labels"].isin([0, 1, 2]).all()
+
+
+def test_regime_detector_requires_fit():
+    """Predicting before fit must raise a clear error."""
+    from app.models.regime import RegimeDetector
+
+    detector = RegimeDetector()
+    with pytest.raises(RuntimeError, match="not been fitted"):
+        detector.predict_latest(None)
