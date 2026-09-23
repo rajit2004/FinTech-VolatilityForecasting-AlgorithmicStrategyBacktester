@@ -50,9 +50,10 @@ Step 3: Storage
           |
           v
 Step 4: Feature Engineering
-  Raw prices turned into 9 features:
+  Raw prices turned into 10 features:
     returns, realized vol, EWMA vol, RSI, ATR,
-    Bollinger position, momentum, volume ratio, day of week
+    Bollinger position, momentum, volume ratio, day of week,
+    sentiment
           |
           v
 Step 5: Target Creation
@@ -60,11 +61,21 @@ Step 5: Target Creation
           |
           v
 Step 6: Model Training
-  Random Forest, LSTM, or GARCH trained on features
+  Random Forest, LSTM, Transformer, or GARCH trained on features
+          |
+          v
+Step 6b: Validation (optional)
+  Walk-forward validation retrains on rolling windows and
+  aggregates metrics across folds
           |
           v
 Step 7: Prediction
   Model forecasts next period volatility
+          |
+          v
+Step 7b: Regime Detection (optional)
+  Gaussian Mixture model labels each day as calm, normal, or
+  volatile based on rolling volatility patterns
           |
           v
 Step 8: Strategy Signals
@@ -72,7 +83,13 @@ Step 8: Strategy Signals
           |
           v
 Step 9: Backtesting
-  Engine simulates trades bar by bar with commission
+  Engine simulates trades bar by bar with commission,
+  volatility-based sizing, stop-loss, and take-profit
+          |
+          v
+Step 9b: Portfolio Backtest (optional)
+  Multiple assets backtested together with equal capital
+  allocation and combined equity curve
           |
           v
 Step 10: Metrics
@@ -120,7 +137,8 @@ pointing at different .env files.
 This is the entry point. It does two things:
 
 1. Starts the Flask API server when run with python -m app.main
-2. Provides a CLI with three commands: fetch, forecast, backtest
+2. Provides a CLI with five commands: fetch, forecast, backtest,
+   regime, and portfolio
 
 The create_app function builds the Flask application, registers the
 API blueprint, and configures CORS so the dashboard can talk to the
@@ -130,11 +148,19 @@ tests can point at an isolated database.
 The CLI commands are thin wrappers:
 - fetch: downloads prices and stores them
 - forecast: trains a model and prints the next period forecast
+  (--model random_forest|lstm|garch|transformer,
+  --validation holdout|walk_forward)
 - backtest: runs a strategy and prints the metrics
+  (--target-vol, --forecast-vol, --stop-loss, --take-profit)
+- regime: detects the current market regime (calm/normal/volatile)
+- portfolio: runs a multi-asset portfolio backtest
+  (--symbols AAPL,MSFT,BTC-USD, --strategy)
 
 The argparse parser supports --model with choices random_forest, lstm,
-and garch. The backtest command supports --target-vol and --forecast-vol
-for volatility-based position sizing.
+garch, and transformer. The forecast command supports --validation
+with holdout or walk_forward modes. The backtest command supports
+--target-vol and --forecast-vol for volatility-based position sizing,
+plus --stop-loss and --take-profit for risk management exits.
 
 ---
 
@@ -242,10 +268,10 @@ to eagerly load trades while the session is open.
 
 ### app/features/engineering.py
 
-This is where raw prices become model inputs. It builds 9 features
+This is where raw prices become model inputs. It builds 10 features
 plus the target variable.
 
-The 9 features:
+The 10 features:
 
 1. returns: daily log returns (log of price ratio). Log returns are
    additive over time, which is useful for volatility work.
@@ -279,6 +305,14 @@ The 9 features:
 9. day_of_week: integer 0-4 (Monday to Friday). Some days have
    different volatility patterns.
 
+10. sentiment: a simulated sentiment score in [-1, 1] derived from
+    return direction and volume ratio. Positive on up days with high
+    volume, negative on down days with high volume. Smoothed with a
+    5-day rolling mean to reduce noise. In a production system this
+    would come from news or social media, but the simulated version
+    lets the model learn the relationship between price/volume
+    dynamics and sentiment without external data.
+
 The target variable: future_realized_volatility computes the realized
 volatility over the NEXT horizon days. This is what the models try
 to predict. Because it looks forward, the last horizon rows have NaN
@@ -286,7 +320,7 @@ targets and are dropped before training.
 
 Key functions:
 
-build_features(df, horizon): builds all 9 features plus the target.
+build_features(df, horizon): builds all 10 features plus the target.
 Returns a DataFrame with everything. Does not drop NaN rows, letting
 callers decide.
 
@@ -314,12 +348,12 @@ Course concepts demonstrated: recursion (recursive_ema), generators
 
 ### app/models/volatility_model.py
 
-This file contains three forecasting models and the pipeline that
-connects them to the rest of the app.
+This file contains four forecasting models, walk-forward validation,
+and the pipeline that connects them to the rest of the app.
 
 **RandomForestVolatilityModel:**
 A scikit-learn RandomForestRegressor with 200 trees and max depth 10.
-Takes the 9 engineered features and predicts future volatility. Does
+Takes the 10 engineered features and predicts future volatility. Does
 not need feature scaling. Handles nonlinear relationships well. This
 is the classical ML baseline.
 
@@ -336,6 +370,22 @@ in the original scale.
 Uses Keras 3 with the JAX backend because TensorFlow has no wheels
 for Python 3.14 yet. The code is identical to the classic TensorFlow
 API, just the backend changes.
+
+Interface: fit(X_seq, y) trains on sequences, predict(X_seq) returns
+predictions.
+
+**TransformerVolatilityModel:**
+A Keras model using multi-head self-attention. Uses the Functional
+API instead of Sequential because MultiHeadAttention takes both query
+and value as inputs. Structure: project features to a higher
+dimension with Dense, apply multi-head attention (each head learns a
+different aspect of which time steps matter most), normalize with
+LayerNormalization, pool the sequence with GlobalAveragePooling1D,
+then Dense layers that shrink to a single volatility number.
+
+Why transformers: attention lets the model weigh recent vs distant
+time steps dynamically, capturing long-range dependencies better than
+the LSTM's fixed memory.
 
 Interface: fit(X_seq, y) trains on sequences, predict(X_seq) returns
 predictions.
@@ -357,19 +407,31 @@ Interface: fit(returns) trains on log returns, predict(horizon) returns
 annualized volatility for the next N days, predict_next() returns a
 single value for the next day.
 
+**walk_forward_validate(X, y, model_factory, n_splits):**
+Walk-forward validation. Instead of one train/test split, the data is
+divided into n_splits chronological folds. For each fold:
+1. Train on all data before the fold's test window
+2. Predict on the fold's test window
+3. Record predictions and metrics
+
+All fold predictions are concatenated and aggregate metrics
+(RMSE, MAE, R-squared) are computed across all folds. This avoids
+overfitting to a single test period and is the standard validation
+method in academic finance ML.
+
 **train_test_split_time(X, y):**
 Splits data in time order, never randomly. The last 20% of rows
 becomes the test set. Time series must never be shuffled before
 splitting because the model learns from the past and is tested on
 the future.
 
-**run_volatility_forecast(df, horizon, model_name):**
+**run_volatility_forecast(df, horizon, model_name, validation):**
 The main pipeline function. Steps:
 1. Build features from the cleaned OHLCV data
 2. Prepare X and y arrays
-3. Split in time order
+3. Choose validation mode (holdout or walk_forward)
 4. Train the chosen model
-5. Evaluate on the test set
+5. Evaluate on the test set (or aggregate across folds)
 6. Produce a one-step-ahead forecast for the next period
 7. Return predictions, metrics, dates, and the next forecast
 
@@ -377,6 +439,10 @@ For GARCH, it works differently: it fits on raw returns, not features,
 so it has its own branch in the function. The test set is evaluated
 by computing realized volatility of the actual test returns and
 comparing against GARCH's conditional variance predictions.
+
+For walk-forward validation, the function calls
+walk_forward_validate and returns fold_metrics plus aggregate_metrics
+in the result dict.
 
 ---
 
@@ -427,6 +493,77 @@ most recent prediction. Produces a human-readable summary like
 
 Why it matters: in financial forecasting, you need to know the model
 is not just memorizing noise. SHAP provides that trust layer.
+
+---
+
+### app/models/regime.py
+
+Market regime detection. Classifies each day as calm, normal, or
+volatile based on rolling volatility patterns.
+
+**RegimeDetector class:**
+Uses sklearn's GaussianMixture (a probabilistic clustering model)
+instead of an HMM because hmmlearn does not build on Python 3.14.
+GaussianMixture fits k Gaussian distributions to a one-dimensional
+volatility feature and assigns each day to the most likely component.
+
+The regimes are ordered by their fitted mean volatility: the component
+with the lowest mean becomes "calm", the middle becomes "normal",
+and the highest becomes "volatile". This ordering ensures the labels
+are always meaningful regardless of how the GMM numbers them.
+
+Interface:
+- fit(rolling_vol): fits the GMM on rolling volatility values
+- predict(rolling_vol): returns an array of regime labels (0/1/2)
+- predict_latest(rolling_vol): returns (regime_id, regime_name) for
+  the most recent day
+
+Convenience function:
+- detect_regimes(df, window=20): computes rolling volatility from
+  the close column, fits the detector, and returns regime_id,
+  regime_name, labels for all days, regime volatility means, and
+  label counts.
+
+Why it matters: strategies that work in calm markets often fail in
+volatile ones. Knowing the current regime lets you adjust position
+sizing or switch strategies. It also provides context for forecast
+errors: models tend to fail during regime transitions.
+
+---
+
+### app/features/sentiment.py
+
+Sentiment feature engineering. In production this would pull from
+news APIs or social media, but a simulated version keeps the project
+fully offline while still demonstrating the concept.
+
+**simulate_sentiment(close, volume, window):**
+Creates a sentiment score in [-1, 1] for each day. Logic:
+1. Daily return direction (positive or negative)
+2. Multiplied by volume ratio (how unusual the volume is)
+3. Smoothed with a rolling mean to reduce noise
+4. Rescaled so the range stays within [-1, 1]
+
+On an up day with unusually high volume, sentiment is positive. On a
+down day with high volume, sentiment is negative. Quiet days score
+near zero.
+
+**score_text_sentiment(texts):**
+Scores raw text strings using a built-in financial lexicon of about
+40 terms. Words like "rally", "growth", "beat" add positive points.
+Words like "crash", "panic", "miss" subtract points. The score is
+normalized by the number of words so longer texts do not dominate.
+Texts with no known words score 0.0 (neutral).
+
+**add_sentiment_features(df):**
+Adds "sentiment" and "sentiment_momentum" columns to a DataFrame.
+sentiment_momentum is the 5-day change in sentiment, capturing
+whether mood is improving or deteriorating.
+
+Why it matters: research shows news sentiment has measurable
+predictive power for volatility, especially during market stress.
+Even the simulated version lets the model learn that high-volume
+moves carry different information than quiet ones.
 
 ---
 
@@ -507,6 +644,10 @@ bar by bar.
 - slippage: per share price slippage (default 0, for simplicity)
 - target_volatility: if > 0, enable vol-based position sizing
 - forecast_volatility: the forecast to scale against
+- stop_loss_pct: exit if price drops this fraction below entry
+  (0 = disabled, e.g. 0.05 exits at 5% loss)
+- take_profit_pct: exit if price rises this fraction above entry
+  (0 = disabled, e.g. 0.15 exits at 15% gain)
 
 **BacktestResult dataclass:**
 Holds symbol, strategy name, params, config, metrics, equity curve,
@@ -520,17 +661,28 @@ Supports "moving_average" and "volatility_breakout".
 The heart of the simulation. A generator that yields one event dict
 per bar. On each day:
 1. Check what position the strategy wants
-2. If different from current position, execute a trade
-3. On buy: calculate budget with vol-based sizing, buy integer shares,
-   deduct commission
-4. On sell: sell all shares, deduct commission, book round-trip PnL
-5. Record date, price, signal, cash, shares, equity
+2. If stop_loss_pct or take_profit_pct are set and a position is
+   held, check whether price has breached the stop or target level
+   since entry. If so, force desired = 0 (exit the position).
+3. If different from current position, execute a trade
+4. On buy: calculate budget with vol-based sizing, buy integer shares,
+   record entry price, deduct commission
+5. On sell: sell all shares, reset entry price, deduct commission,
+   book round-trip PnL
+6. Record date, price, signal, cash, shares, equity
 
 Volatility-based position sizing: when target_volatility and
 forecast_volatility are both positive, the position budget is scaled
 by min(target / forecast, 1.0). When forecast volatility is high,
 we trade less. When it is low, we trade the full amount. This directly
 connects the forecasting and trading halves of the project.
+
+Stop-loss and take-profit: when a position is open, the engine tracks
+the entry price. On each subsequent bar, if the current price is at
+or below entry * (1 - stop_loss_pct), or at or above
+entry * (1 + take_profit_pct), the position is force-closed. This is
+the most basic form of risk management and is standard in real
+trading systems.
 
 **run_backtest(symbol, df, strategy_name, params, config):**
 Runs one backtest end to end. Creates the strategy, runs the event
@@ -542,6 +694,35 @@ Runs a grid of parameter combinations. When parallel=True, uses
 ProcessPoolExecutor to run them on multiple cores. Each worker gets
 one parameter set. The _run_one function must be at module level
 (not a method) so it can be pickled on Windows.
+
+---
+
+### app/backtester/portfolio.py
+
+Multi-asset portfolio backtesting. Runs the same strategy across
+several symbols simultaneously with equal capital allocation.
+
+**run_portfolio_backtest(data, strategy_name, params, config):**
+Takes a dict mapping symbol to DataFrame, a strategy name, optional
+params, and an optional BacktestConfig. Steps:
+1. Validate that at least one symbol is provided (raises ValueError
+   on empty input)
+2. Split initial_capital equally across all symbols
+3. Run run_backtest independently for each symbol with its own
+   capital allocation
+4. Align all equity curves on their union of dates using
+   pd.concat(..., join="outer").ffill() so missing days (different
+   market holidays) are forward-filled
+5. Compute portfolio-level metrics from the combined equity curve
+6. Return portfolio_metrics, portfolio_equity_curve, per-symbol
+   individual results, and the per-symbol capital amount
+
+Why it matters: single-asset backtests can be misleading. A strategy
+that works great on AAPL might fail on BTC-USD. Diversification
+across uncorrelated assets reduces drawdown, which is the main
+practical benefit of portfolio construction. This function gives a
+realistic view of how the strategy performs as a portfolio, not just
+in isolation.
 
 ---
 
@@ -590,20 +771,35 @@ GET /api/features/{symbol}: returns engineered features.
 Optional ?horizon=5 sets the forecast horizon.
 
 POST /api/forecast: trains a model and returns a forecast.
-Accepts {"symbol": "AAPL", "model_name": "random_forest", "horizon": 5}.
-Returns next forecast, metrics, test predictions and true values.
+Accepts {"symbol": "AAPL", "model_name": "random_forest", "horizon": 5,
+"validation": "holdout", "n_walk_forward_folds": 5}.
+model_name can be random_forest, lstm, garch, or transformer.
+validation can be holdout (single split) or walk_forward (rolling
+retraining across multiple folds). Returns next forecast, metrics,
+test predictions and true values, and fold_metrics when walk_forward
+is used.
 
 GET /api/explain/{symbol}: explains which features drive the random
 forest forecast using SHAP. Returns feature importance rankings and
 the top contributing features for the most recent prediction.
+
+GET /api/regime/{symbol}: detects the current market regime for a
+symbol. Returns regime_id, regime_name (calm/normal/volatile),
+regime volatility means, label counts, and the full regime series
+for charting.
 
 GET /api/forecasts/{symbol}: lists stored forecasts.
 Optional ?model_name=lstm filters by model.
 
 POST /api/backtest: runs a backtest. Accepts symbol, strategy name,
 strategy params, and optional config with initial_capital, commission,
-target_volatility, and forecast_volatility. Returns metrics, equity
-curve, and trades.
+target_volatility, forecast_volatility, stop_loss_pct, and
+take_profit_pct. Returns metrics, equity curve, and trades.
+
+POST /api/portfolio/backtest: runs a multi-asset portfolio backtest.
+Accepts {"symbols": ["AAPL", "MSFT", "BTC-USD"], "strategy":
+"moving_average", "params": {...}}. Returns portfolio-level metrics,
+combined equity curve, and per-symbol results.
 
 GET /api/backtests: lists all stored backtest runs.
 Optional ?symbol=AAPL filters the list.
@@ -625,12 +821,13 @@ parse_fetch_payload: validates symbols (accepts list or comma-separated
 string), start and end dates.
 
 parse_forecast_payload: validates symbol, model_name (must be
-random_forest, lstm, or garch), and horizon.
+random_forest, lstm, garch, or transformer), horizon, validation
+(must be holdout or walk_forward), and n_walk_forward_folds.
 
 parse_backtest_payload: validates symbol, strategy name (must be
 moving_average or volatility_breakout), params, and config. Config
-includes initial_capital, commission, target_volatility, and
-forecast_volatility.
+includes initial_capital, commission, target_volatility,
+forecast_volatility, stop_loss_pct, and take_profit_pct.
 
 parse_symbols: normalizes and validates a list of ticker symbols.
 
@@ -741,7 +938,7 @@ comparison. Run with: python scripts/demo_backtest.py --symbol AAPL
 
 ---
 
-### tests/ (6 test files, 64 test cases)
+### tests/ (6 test files, 80 test cases)
 
 conftest.py: shared fixtures. clean_frame generates reproducible
 synthetic OHLCV data. configured_db points the database at a temp
@@ -751,11 +948,15 @@ test_data.py: tests cleaning, CSV loading, database roundtrip,
 async fetching, retry and caching decorators.
 
 test_features.py: tests log returns, realized volatility, recursive
-EMA, deque rolling mean, feature building, LSTM sequence creation.
+EMA, deque rolling mean, feature building, LSTM sequence creation,
+and sentiment features (simulated sentiment range, text scoring,
+feature columns).
 
 test_models.py: tests random forest predictions, time split, evaluator
-metrics, LSTM training, GARCH training, SHAP explainability, and the
-full forecast pipeline for all three models.
+metrics, LSTM training, GARCH training, SHAP explainability, walk-
+forward validation (folds, pipeline, mode rejection), transformer
+training, regime detection, and the full forecast pipeline for all
+four models.
 
 test_strategies.py: tests strategy abstract class, MA crossover logic
 (uptrend, downtrend, warmup, parameter validation), volatility
@@ -763,9 +964,11 @@ breakout logic.
 
 test_backtester.py: tests backtest results, empty frame rejection,
 unknown strategy rejection, flat strategy, generator type, metrics
-calculation, grid runs, and volatility-based position sizing (3 tests:
+calculation, grid runs, volatility-based position sizing (3 tests:
 high vol reduces position, low vol gives full position, disabled when
-zero).
+zero), stop-loss, take-profit, combined stop-loss and take-profit,
+and portfolio backtest (results, empty data rejection, equal capital
+split).
 
 test_api.py: tests all API endpoints through the Flask test client.
 Health check, data fetch, prices, backtest flow, forecast, stored
@@ -776,7 +979,7 @@ isolated temporary database. They do not need PostgreSQL running.
 
 ---
 
-## 4. The Three Models
+## 4. The Four Models
 
 ### Random Forest
 
@@ -787,7 +990,7 @@ overfitting compared to a single tree.
 
 Why it fits: random forests handle nonlinear relationships well, do
 not need feature scaling, and are fast to train. They work great on
-tabular data like our 9-feature set.
+tabular data like our 10-feature set.
 
 Our implementation: 200 trees, max depth 10, trained with 80% of the
 data (time-ordered split), tested on the remaining 20%.
@@ -806,6 +1009,24 @@ recurrent structure is a natural match for this kind of data.
 Our implementation: one LSTM layer with 64 units, followed by Dense(16,
 relu) and Dense(1). Features scaled to 0-1 with MinMaxScaler. Trained
 for 25 epochs with batch size 32. Uses Keras 3 with JAX backend.
+
+### Transformer
+
+How it works: a Transformer uses self-attention to weigh the importance
+of different time steps dynamically. Instead of reading the sequence
+left to right like an LSTM, attention lets the model look at all time
+steps at once and decide which ones matter for the current prediction.
+Multiple heads learn different types of temporal patterns in parallel.
+
+Why it fits: volatility spikes often have detectable precursors that
+may be several days back in the sequence. Attention can reach back
+to those precursors regardless of distance, which is harder for the
+LSTM's fixed-size memory.
+
+Our implementation: Functional API model with Dense projection,
+MultiHeadAttention (4 heads, key_dim 32), LayerNormalization,
+GlobalAveragePooling1D, Dropout, and Dense output. Same sequence
+length and scaling as the LSTM. Uses Keras 3 with JAX backend.
 
 ### GARCH(1,1)
 
@@ -832,21 +1053,25 @@ works directly on returns.
 Random Forest: fastest to train (seconds), handles nonlinear feature
 interactions, may miss temporal patterns.
 
-LSTM: slowest to train (minutes), captures temporal patterns in
+LSTM: slow to train (minutes), captures temporal patterns in
 sequences, needs feature scaling.
+
+Transformer: similar training time to LSTM, captures long-range
+dependencies via attention, needs feature scaling and the Functional
+API.
 
 GARCH: fastest overall (milliseconds), purely statistical, no feature
 engineering needed, but limited to linear variance dynamics.
 
-The evaluation shows RMSE, MAE, and R-squared for all three on the
-same test period, so you can see which one actually works best on
-your data.
+The evaluation shows RMSE, MAE, and R-squared for all four on the
+same test period (or aggregated across walk-forward folds), so you
+can see which one actually works best on your data.
 
 ---
 
 ## 5. Feature Engineering
 
-The 9 features in detail:
+The 10 features in detail:
 
 1. returns (log returns): log(close[t] / close[t-1]). Additive over
    time, symmetric around zero, and the foundation for all volatility
@@ -877,6 +1102,12 @@ The 9 features in detail:
 
 9. day_of_week: integer 0-4. Captures weekly patterns like Monday
    effect or Friday profit-taking.
+
+10. sentiment: simulated sentiment score in [-1, 1] derived from
+    return direction and volume ratio, smoothed with a 5-day rolling
+    mean. Positive on high-volume up days, negative on high-volume
+    down days. Lets the model learn the relationship between price
+    dynamics and market mood without external data sources.
 
 The target: future realized volatility over the next horizon days.
 This is what the models predict. It is the rolling standard deviation
@@ -948,6 +1179,36 @@ the normal size. If forecast_vol is below target, full position is
 used. This directly connects the forecasting output to the trading
 decision.
 
+### Stop-Loss and Take-Profit
+
+When stop_loss_pct or take_profit_pct are set in the config, the
+engine tracks the entry price of each open position. On every
+subsequent bar:
+
+- If price <= entry * (1 - stop_loss_pct), force a sell (stop loss)
+- If price >= entry * (1 + take_profit_pct), force a sell (take profit)
+
+Both default to 0 (disabled). Setting stop_loss_pct=0.05 means you
+exit if the position drops 5% below your entry. Setting
+take_profit_pct=0.15 means you lock in gains at a 15% rise. These
+can be used together: stop at -5%, take profit at +15%.
+
+This is the most basic risk management rule and is standard in real
+trading systems. It prevents a single bad trade from wiping out
+gains from many good ones.
+
+### Multi-Asset Portfolio Backtesting
+
+run_portfolio_backtest takes data for multiple symbols, splits the
+initial capital equally across them, runs each backtest
+independently, then combines the equity curves. The combined curve
+is built by aligning all dates (union) and forward-filling gaps.
+Portfolio-level metrics (Sharpe, drawdown, total return) are
+computed from this combined curve.
+
+This gives a realistic view of how the strategy performs as a
+diversified portfolio rather than a single lucky symbol.
+
 ### Metrics
 
 Sharpe ratio: return per unit of risk. The single most important
@@ -999,9 +1260,17 @@ All endpoints are prefixed with /api.
 
 ### Forecast Volatility
     POST /api/forecast
-    Body: {"symbol": "AAPL", "model_name": "random_forest", "horizon": 5}
-    model_name can be random_forest, lstm, or garch.
+    Body: {
+      "symbol": "AAPL",
+      "model_name": "random_forest",
+      "horizon": 5,
+      "validation": "walk_forward",
+      "n_walk_forward_folds": 5
+    }
+    model_name can be random_forest, lstm, garch, or transformer.
+    validation can be holdout (default) or walk_forward.
     Returns next forecast, metrics, test predictions and true values.
+    When walk_forward is used, also returns fold_metrics.
 
 ### Explain Model
     GET /api/explain/AAPL
@@ -1024,10 +1293,28 @@ All endpoints are prefixed with /api.
         "initial_capital": 100000,
         "commission": 0.001,
         "target_volatility": 0.15,
-        "forecast_volatility": 0.25
+        "forecast_volatility": 0.25,
+        "stop_loss_pct": 0.05,
+        "take_profit_pct": 0.15
       }
     }
     Returns run_id, metrics, equity curve, and trades.
+
+### Detect Regime
+    GET /api/regime/AAPL
+    Optional: ?window=20
+    Returns current regime (calm/normal/volatile), regime volatility
+    means, label counts, and the full regime label series.
+
+### Portfolio Backtest
+    POST /api/portfolio/backtest
+    Body: {
+      "symbols": ["AAPL", "MSFT", "BTC-USD"],
+      "strategy": "moving_average",
+      "params": {"fast": 10, "slow": 50}
+    }
+    Returns portfolio metrics, combined equity curve, and
+    per-symbol individual results.
 
 ### List Backtests
     GET /api/backtests
@@ -1114,24 +1401,30 @@ session can be closed immediately.
 
 ## 11. Testing
 
-64 test cases across 6 files:
+80 test cases across 6 files:
 
 test_data.py (9 tests): cleaning, CSV loading, database roundtrip,
 async fetching, retry decorator, caching decorator.
 
-test_features.py (8 tests): log returns, realized volatility,
-recursive EMA, deque rolling mean, feature building, LSTM sequences.
+test_features.py (13 tests): log returns, realized volatility,
+recursive EMA, deque rolling mean, feature building, LSTM sequences,
+sentiment scoring, sentiment feature range, add_sentiment_features.
 
-test_models.py (14 tests): random forest predictions, time split,
+test_models.py (21 tests): random forest predictions, time split,
 evaluator metrics, LSTM training, GARCH fit/predict, SHAP
-explainability, full pipeline for all three models.
+explainability, walk-forward validation (folds, full pipeline,
+validation mode rejection), transformer training (shapes and full
+pipeline), regime detection (labels and fit requirement), full
+pipeline for all four models.
 
 test_strategies.py (8 tests): abstract class enforcement, MA crossover
 logic, parameter validation, volatility breakout logic.
 
-test_backtester.py (11 tests): backtest results, error handling,
+test_backtester.py (17 tests): backtest results, error handling,
 flat strategy, generator type, metrics, grid runs, vol sizing (3
-tests for high vol, low vol, and disabled).
+tests for high vol, low vol, and disabled), stop-loss, take-profit,
+combined stop-loss and take-profit, portfolio backtest (results,
+empty data rejection, equal capital split).
 
 test_api.py (12 tests): all API endpoints through the Flask test
 client. Health, fetch, prices, backtest flow, forecast, forecasts
@@ -1184,56 +1477,92 @@ turn the forecast into a strategy. A backtesting paper assumes you
 already have good signals. This project joins all three into one
 working system.
 
-### Our Tier 1 Improvements
+### Our Improvements
 
-GARCH baseline: provides the statistical benchmark that ML models
-must beat to prove value. Without it, our results are not credible
-in any academic context.
+Tier 1 (completed):
+- GARCH baseline: provides the statistical benchmark that ML models
+  must beat to prove value. Without it, our results are not credible
+  in any academic context.
+- SHAP explainability: shows which features drive predictions.
+  Provides the trust layer that regulators increasingly demand.
+  Without it, the model is a black box.
+- Volatility-based position sizing: connects the forecasting output
+  to the trading decision. When the model says volatility is high,
+  the backtester trades less. This is the natural risk management
+  approach that professional traders use.
 
-SHAP explainability: shows which features drive predictions. Provides
-the trust layer that regulators increasingly demand. Without it,
-the model is a black box.
-
-Volatility-based position sizing: connects the forecasting output
-to the trading decision. When the model says volatility is high,
-the backtester trades less. This is the natural risk management
-approach that professional traders use.
+Tier 2 (completed):
+- Walk-forward validation: instead of a single train/test split,
+  the model is retrained on a rolling window across multiple folds
+  and metrics are aggregated. Avoids overfitting to one test period
+  and is the standard in academic ML for finance.
+- Regime detection: a Gaussian Mixture model classifies each day as
+  calm, normal, or volatile based on rolling volatility. Provides
+  context for forecast errors and strategy performance. hmmlearn
+  does not build on Python 3.14, so sklearn's GaussianMixture is
+  used instead of an HMM.
+- Transformer model: an attention-based model that captures
+  long-range dependencies better than the LSTM. Uses the Functional
+  API because MultiHeadAttention requires both query and value
+  inputs.
+- Sentiment features: simulated sentiment derived from return
+  direction and volume ratio, plus a lexicon-based text scorer for
+  raw news headlines. Lets the model learn mood dynamics without
+  external data sources.
+- Stop-loss and take-profit: risk management rules that close
+  positions when losses exceed a threshold or gains reach a target.
+  Standard in real trading systems.
+- Multi-asset portfolio backtest: runs the same strategy across
+  multiple symbols with equal capital allocation and combined
+  equity curve. Shows how diversification affects drawdown.
 
 ---
 
 ## 14. Future Scope
 
-### Tier 2 (do next)
+### Completed (Tier 1 + Tier 2)
 
-Walk-forward validation: instead of a single train/test split, retrain
-the model on a rolling window and retest. This avoids overfitting and
-is the standard in academic ML for finance.
+Walk-forward validation: done. Retrains on rolling windows and
+aggregates metrics across folds.
 
-Regime detection: add an HMM that detects calm vs volatile markets.
-Switch strategy behavior based on the detected regime. Markets in
-crisis behave differently than markets in calm trends.
+Regime detection: done. GaussianMixture classifies days as calm,
+normal, or volatile.
 
-Transformer model: replace or supplement the LSTM with an attention-
-based model. Transformers capture long-range dependencies better
-than LSTMs.
+Transformer model: done. Multi-head attention model added alongside
+LSTM and GARCH.
 
-Sentiment analysis: add news or social media sentiment as a feature.
-Research shows sentiment has measurable predictive power for
-volatility, especially during market stress.
+Sentiment analysis: done. Simulated sentiment from price/volume plus
+lexicon-based text scoring.
+
+Stop-loss and take-profit: done. Both configurable per backtest.
+
+Multi-asset portfolio: done. Equal capital split with combined
+equity curve and portfolio-level metrics.
 
 ### Tier 3 (future work)
-
-Multi-asset portfolio: backtest across multiple assets simultaneously.
-Diversification reduces drawdown.
 
 Real-time feeds: scheduled jobs that re-fetch prices and re-run
 forecasts. A "last updated" timestamp on the dashboard.
 
-Stop-loss and take-profit: risk management rules that close positions
-when losses exceed a threshold.
-
 Alternative data: on-chain metrics for crypto, options-implied
 volatility (VIX), macroeconomic indicators.
+
+Live news sentiment: replace the simulated sentiment with real news
+API data (NewsAPI, Alpha Vantage news, or Twitter/X API).
+
+Hyperparameter tuning: Bayesian optimization for model and strategy
+parameters instead of manual grid search.
+
+Walk-forward with purging and embargo: add gaps between train and
+test windows to prevent information leakage from overlapping labels.
+
+Portfolio optimization: mean-variance optimization or risk parity
+for capital allocation across assets instead of equal splits.
+
+Transaction cost models: slippage models that depend on order size
+and market volume instead of a fixed per-share slippage.
+
+Short selling: allow negative positions with borrow costs.
 
 ---
 
@@ -1274,7 +1603,125 @@ volatility (VIX), macroeconomic indicators.
 
 ### CLI Commands
 
+    # Basic forecast with random forest (holdout validation)
+    python -m app.main forecast --symbol AAPL --model random_forest
+
+    # Walk-forward validation with 5 folds
+    python -m app.main forecast --symbol AAPL --model random_forest --validation walk_forward
+
+    # Transformer model
+    python -m app.main forecast --symbol AAPL --model transformer
+
+    # GARCH statistical baseline
     python -m app.main forecast --symbol AAPL --model garch
+
+    # Simple backtest
     python -m app.main backtest --symbol AAPL --strategy moving_average
-    python -m app.main backtest --symbol AAPL --strategy volatility_breakout --target-vol 0.15 --forecast-vol 0.25
+
+    # Backtest with volatility sizing and risk exits
+    python -m app.main backtest --symbol AAPL --strategy volatility_breakout --target-vol 0.15 --forecast-vol 0.25 --stop-loss 0.05 --take-profit 0.15
+
+    # Detect current market regime
+    python -m app.main regime --symbol AAPL
+
+    # Multi-asset portfolio backtest
+    python -m app.main portfolio --symbols AAPL,MSFT,BTC-USD --strategy moving_average
+
     python scripts/demo_backtest.py --symbol AAPL
+
+---
+
+## 16. FAQ
+
+**Q: Why does the project use JAX instead of TensorFlow?**
+A: TensorFlow has no Python 3.14 wheels yet. Keras 3 supports multiple
+backends, so the same model code runs on JAX. The API is identical.
+
+**Q: Why GaussianMixture instead of HMM for regime detection?**
+A: hmmlearn (the HMM library) fails to build on Python 3.14 because
+of Cython compatibility. sklearn's GaussianMixture achieves similar
+results for 1-dimensional volatility clustering without the build
+problem.
+
+**Q: Why is sentiment simulated instead of using real news data?**
+A: The project must run fully offline for reproducibility. A simulated
+sentiment score derived from price and volume lets the model learn
+the same relationships without API keys or network calls. The
+score_text_sentiment function is ready for real headlines when
+connected to a news API.
+
+**Q: Why walk-forward validation instead of a random train/test split?**
+A: Financial time series must never be shuffled. Random splits leak
+future information into training. Walk-forward retrains on expanding
+or rolling windows and tests only on future data, which is the
+standard practice in academic finance ML.
+
+**Q: How many features does the model use?**
+A: 10 features: returns, realized_vol, ewma_vol, rsi, atr,
+bollinger_position, momentum, volume_ratio, day_of_week, and
+sentiment.
+
+**Q: Can I add a new trading strategy?**
+A: Yes. Create a class that inherits from BaseStrategy and implements
+generate_signals(df) returning a Series of -1, 0, or +1. Then add
+the name to VALID_STRATEGIES in app/api/schemas.py and the factory
+in get_strategy() in app/backtester/engine.py.
+
+**Q: Does the backtester account for transaction costs?**
+A: Yes. A commission of 0.1% per side is charged on every buy and
+sell. A $10,000 trade costs $10 each way. Slippage is also
+configurable but defaults to 0.
+
+**Q: What is the difference between holdout and walk-forward?**
+A: Holdout trains once on the first 80% and tests on the last 20%.
+Walk-forward splits the data into N chronological folds, trains on
+all data before each fold's test window, and aggregates metrics
+across all folds. Walk-forward is more reliable because it tests on
+multiple periods instead of one.
+
+---
+
+## 17. Troubleshooting
+
+**Problem: MultiHeadAttention has multiple required positional
+arguments**
+Cause: Using Sequential API for the transformer. MultiHeadAttention
+needs both query and value inputs, which Sequential cannot provide.
+Fix: Use the Functional API (Input -> Dense -> MultiHeadAttention
+(query=x, value=x) -> ... -> Model). This is already done in
+TransformerVolatilityModel.
+
+**Problem: arch.forecast() returns ARCHModelForecast, not a dict**
+Cause: Using dict-style access like fcst["variance"] on an
+ARCHModelForecast object.
+Fix: Use attribute access: fcst.variance.iloc[-1].values
+
+**Problem: hmmlearn fails to build on Python 3.14**
+Cause: Cython incompatibility with Python 3.14.
+Fix: Use sklearn.mixture.GaussianMixture instead, as done in
+app/models/regime.py.
+
+**Problem: Feature count assertion fails (10 != 9)**
+Cause: The sentiment feature was added, increasing FEATURE_COLUMNS
+from 9 to 10.
+Fix: Update the test to expect 10 features.
+
+**Problem: SQLAlchemy DeprecationWarning about utcnow()**
+Cause: datetime.utcnow() is deprecated in Python 3.12+.
+Fix: This is a warning, not an error. It can be ignored or fixed by
+switching to datetime.now(timezone.utc) in database.py.
+
+**Problem: Tests fail with "no PostgreSQL"**
+Cause: Tests should use SQLite via the configured_db fixture.
+Fix: Run tests with: .venv\Scripts\pytest tests/ -v. The conftest.py
+fixtures automatically point at a temporary SQLite file.
+
+**Problem: yfinance download returns empty or multi-index columns**
+Cause: yfinance API changes between versions.
+Fix: The fetcher already handles the multi-index issue and falls back
+to bundled CSV files when the download fails.
+
+**Problem: Transformer training is slow**
+Cause: Attention models have more parameters than a single LSTM layer.
+Fix: Reduce sequence_length, num_heads, or epochs for quick tests.
+The default is sequence_length=30, num_heads=4, epochs=25.

@@ -47,6 +47,7 @@ The project does three big things:
 | --------------------- | ------------------------------ | ------------------------------------------- |
 | 🌲 **Random Forest**  | scikit-learn regressor         | A solid classical ML baseline that handles nonlinear patterns |
 | 🧠 **LSTM**           | Keras 3 (deep learning)        | A recurrent network built for time series   |
+| 🌀 **Transformer**    | Keras 3 (attention)            | Multi-head attention for long-range temporal patterns |
 | 📊 **GARCH(1,1)**     | arch library (statistical)     | The classic volatility baseline every ML model should beat |
 
 ### The trading strategies
@@ -63,14 +64,29 @@ The project does three big things:
 * 🧮 **Realized & EWMA Volatility**
   Rolling and exponentially weighted volatility, annualized and ready for the models.
 
-* 🤖 **Three Forecasting Models**
-  A random forest, an LSTM and a GARCH baseline, all trained on the same data and compared on the same test period.
+* 🤖 **Four Forecasting Models**
+  A random forest, an LSTM, a Transformer and a GARCH baseline, all trained on the same data and compared on the same test period.
+
+* 🔄 **Walk-Forward Validation**
+  Instead of one train/test split, the model is retrained on rolling windows across multiple folds and metrics are aggregated, the standard practice in academic finance ML.
+
+* 🌀 **Market Regime Detection**
+  A Gaussian Mixture model classifies each day as calm, normal or volatile based on rolling volatility, giving context to forecast errors and strategy performance.
+
+* 💬 **Sentiment Features**
+  Simulated sentiment derived from return direction and volume ratio, plus a lexicon-based text scorer for news headlines.
 
 * 🔍 **Model Explainability with SHAP**
   SHAP feature importance shows which inputs drive the random forest predictions, so you know the model is not just memorizing noise.
 
 * 📉 **Volatility-Based Position Sizing**
   When the forecast says volatility is high, the backtester automatically reduces the position size to protect capital.
+
+* 🛑 **Stop-Loss & Take-Profit**
+  Configurable risk exits that close positions when losses exceed a threshold or gains reach a target.
+
+* 📦 **Multi-Asset Portfolio Backtesting**
+  Run the same strategy across multiple symbols with equal capital allocation and a combined equity curve.
 
 * 🧪 **Backtesting Engine**
   Simulates trades bar by bar with commission, and reports Sharpe ratio, max drawdown, win rate and profit factor.
@@ -104,22 +120,28 @@ Cleaner sorts, deduplicates and fills gaps
 Prices are stored in PostgreSQL
         |
         v
-Feature engineering: returns, realized & EWMA vol, RSI, ATR...
+Feature engineering: returns, realized & EWMA vol, RSI, ATR, sentiment...
         |
         v
 Train / test split in time order (no peeking into the future)
+or walk-forward validation across rolling folds
         |
         v
-Random forest, LSTM or GARCH forecasts next period volatility
+Random forest, LSTM, Transformer or GARCH forecasts next period volatility
         |
         v
 SHAP explains which features drove the forecast
+Gaussian Mixture detects the market regime (calm / normal / volatile)
         |
         v
 Strategy generates buy / sell signals
         |
         v
-Backtester simulates trades with commission and vol-based sizing
+Backtester simulates trades with commission, vol-based sizing,
+stop-loss and take-profit exits
+        |
+        v
+Optional multi-asset portfolio backtest with combined equity curve
         |
         v
 Metrics (Sharpe, drawdown, win rate) are stored and shown
@@ -136,10 +158,10 @@ Flask API serves JSON, dashboard renders the charts
 | ---------------------- | --------------------------------------------- |
 | **Language**           | Python 3.14                                   |
 | **Data handling**      | pandas, NumPy                                 |
-| **Classical ML**       | scikit-learn (RandomForestRegressor)          |
+| **Classical ML**       | scikit-learn (RandomForestRegressor, GaussianMixture) |
 | **Statistical ML**     | arch (GARCH volatility models)                |
 | **Model explainability** | shap (SHAP feature importance)              |
-| **Deep learning**      | Keras 3 with the JAX backend (LSTM)           |
+| **Deep learning**      | Keras 3 with the JAX backend (LSTM, Transformer) |
 | **Data source**        | yfinance (with bundled CSV fallback)          |
 | **Database**           | PostgreSQL via SQLAlchemy                     |
 | **Database driver**    | psycopg (version 3)                           |
@@ -161,10 +183,10 @@ capstone4-volatility-forecaster/
 |   |   +-- main.py            # entry point, starts Flask server and CLI
 |   |   +-- config.py          # loads settings from .env
 |   |   +-- data/              # fetcher (asyncio), cleaner, database
-|   |   +-- features/          # feature engineering, volatility targets
-|   |   +-- models/            # random forest, LSTM, GARCH, SHAP explainer
+|   |   +-- features/          # feature engineering, volatility targets, sentiment
+|   |   +-- models/            # random forest, LSTM, transformer, GARCH, regime, SHAP explainer
 |   |   +-- strategies/        # moving average, volatility breakout
-|   |   +-- backtester/        # engine, performance metrics, vol sizing
+|   |   +-- backtester/        # engine, metrics, vol sizing, portfolio
 |   |   +-- api/               # Flask routes and request validation
 |   |   +-- utils/             # logger and custom decorators
 |   |
@@ -176,7 +198,7 @@ capstone4-volatility-forecaster/
 |   |   +-- fetch_and_seed.py         # generates data and loads it into the DB
 |   |   +-- demo_backtest.py          # quick command line comparison
 |   |
-|   +-- tests/                 # pytest suite (64 test cases)
+|   +-- tests/                 # pytest suite (80 test cases)
 |   +-- docs/                  # research gap, system design, final report
 |   +-- notebooks/             # exploration notebook
 |   +-- dataset/               # generated sample CSVs (created on demand)
@@ -354,11 +376,13 @@ POST /api/forecast
 {
   "symbol": "AAPL",
   "model_name": "random_forest",
-  "horizon": 5
+  "horizon": 5,
+  "validation": "walk_forward",
+  "n_walk_forward_folds": 5
 }
 ```
 
-`model_name` can be `random_forest`, `lstm` or `garch`. The response includes the next period forecast, the test metrics (RMSE, MAE, R squared) and the test predictions.
+`model_name` can be `random_forest`, `lstm`, `garch` or `transformer`. `validation` can be `holdout` (single split, default) or `walk_forward` (rolling retraining across `n_walk_forward_folds` folds). The response includes the next period forecast, the test metrics (RMSE, MAE, R squared), the test predictions, and `fold_metrics` when walk-forward is used.
 
 ---
 
@@ -399,12 +423,14 @@ POST /api/backtest
     "initial_capital": 100000,
     "commission": 0.001,
     "target_volatility": 0.15,
-    "forecast_volatility": 0.25
+    "forecast_volatility": 0.25,
+    "stop_loss_pct": 0.05,
+    "take_profit_pct": 0.15
   }
 }
 ```
 
-The `config` block is optional. When `target_volatility` and `forecast_volatility` are both provided, the backtester scales the position size by `min(target / forecast, 1.0)`, reducing exposure when the forecast says volatility is high.
+The `config` block is optional. When `target_volatility` and `forecast_volatility` are both provided, the backtester scales the position size by `min(target / forecast, 1.0)`, reducing exposure when the forecast says volatility is high. When `stop_loss_pct` or `take_profit_pct` are set (0 disables), the position is force-closed if price drops below `entry * (1 - stop_loss_pct)` or rises above `entry * (1 + take_profit_pct)`.
 
 **Response**
 
@@ -422,6 +448,36 @@ The `config` block is optional. When `target_volatility` and `forecast_volatilit
   }
 }
 ```
+
+---
+
+## Detect Market Regime
+
+```http
+GET /api/regime/{symbol}
+```
+
+Optional `?window=20` sets the rolling volatility window. Returns the current regime (`calm`, `normal` or `volatile`), the fitted regime volatility means, label counts, and the full regime label series for charting.
+
+---
+
+## Portfolio Backtest
+
+```http
+POST /api/portfolio/backtest
+```
+
+**Request Body**
+
+```json
+{
+  "symbols": ["AAPL", "MSFT", "BTC-USD"],
+  "strategy": "moving_average",
+  "params": { "fast": 10, "slow": 50 }
+}
+```
+
+Splits the initial capital equally across all symbols, runs each backtest independently, then combines the equity curves. Returns portfolio-level metrics, the combined equity curve, and per-symbol individual results.
 
 ---
 
@@ -450,10 +506,15 @@ Returns the run details together with every trade it produced.
 ```bash
 python -m app.main fetch --symbols AAPL,MSFT,BTC-USD
 python -m app.main forecast --symbol AAPL --model random_forest
+python -m app.main forecast --symbol AAPL --model transformer
 python -m app.main forecast --symbol AAPL --model garch
+python -m app.main forecast --symbol AAPL --model random_forest --validation walk_forward
 python -m app.main backtest --symbol AAPL --strategy moving_average
 python -m app.main backtest --symbol AAPL --strategy volatility_breakout
 python -m app.main backtest --symbol AAPL --strategy moving_average --target-vol 0.15 --forecast-vol 0.25
+python -m app.main backtest --symbol AAPL --strategy moving_average --stop-loss 0.05 --take-profit 0.15
+python -m app.main regime --symbol AAPL
+python -m app.main portfolio --symbols AAPL,MSFT,BTC-USD --strategy moving_average
 ```
 
 ---
@@ -474,7 +535,7 @@ Prints a side by side comparison of both strategies on one symbol.
 python -m pytest -v
 ```
 
-The suite runs fully offline on seeded synthetic data against an isolated temporary database (the tests do not need your PostgreSQL server). 64 test cases cover normal inputs, invalid inputs, edge cases, the GARCH baseline, SHAP explainability and volatility-based position sizing.
+The suite runs fully offline on seeded synthetic data against an isolated temporary database (the tests do not need your PostgreSQL server). 80 test cases cover normal inputs, invalid inputs, edge cases, the GARCH baseline, transformer, walk-forward validation, regime detection, stop-loss and take-profit, portfolio backtesting, SHAP explainability, sentiment features and volatility-based position sizing.
 
 ## Data Sources
 
